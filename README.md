@@ -45,6 +45,38 @@ try {
 
 当前只支持 v2 密文格式；不兼容旧 v1 密文。
 
+## 一键取消全部活跃 LP 仓位
+
+脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
+
+`.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC：
+
+```dotenv
+RPC_URL=https://your-rpc.example
+```
+
+先运行 dry-run。该模式会查询仓位、校验 `strategyBytes` 哈希、读取链上 `rawBalances` 并模拟每笔 `dock`，但绝不广播交易：
+
+```bash
+bun run cancel-all-active-lp --dry-run
+```
+
+确认日志中的仓位信息无误后，再执行真实关闭：
+
+```bash
+bun run cancel-all-active-lp
+```
+
+执行过程会隐藏输入解密密码，在 `logs/` 下生成本次运行日志。日志文件名为 `YYYY-MM-DD HH-mm-ss.SSS.log`，内容格式为 `YYYY-MM-DD HH:mm:ss.SSS [info]: ...`。脚本逐仓位串行关闭；任一仓位预检、模拟、广播、回执、`Docked` 事件或关闭后链上状态复核失败时，立即停止后续仓位。
+
+为避免把单页查询结果误认为全部仓位，如果查询结果达到接口当前使用的 `limit=100`，脚本会直接停止，不会只关闭前 100 个仓位。关闭成功以链上 receipt、Aqua registry 的 `Docked` 事件以及 `rawBalances` 复核为准，策略查询接口仅用于发现候选仓位。
+
+查看命令帮助：
+
+```bash
+bun run cancel-all-active-lp --help
+```
+
 ## 运行
 
 ```bash

@@ -33,7 +33,6 @@
 
 - Chainlink 价格接口。
 - Chainlink 与 EMSH 价格交叉校验。
-- 撤销 LP（dock）。
 - 追加已有策略的流动性。
 - 修改已有策略参数。
 - 自动平仓或定时任务。
@@ -73,7 +72,8 @@
 │   └── wallet/
 │       └── private-key.ts          # 复用现有解密模块并管理敏感 Buffer 生命周期
 ├── scripts/
-│   └── encrypt-private-key.ts      # 已有私钥加密和解密模块，保持不变
+│   ├── encrypt-private-key.ts      # 已有私钥加密和解密模块，保持不变
+│   └── cancel-all-active-lp.ts     # 当前优先实现：查询并串行 dock 当前 maker 的全部活跃仓位
 ├── logs/                           # 运行时生成，必须加入 .gitignore
 ├── index.ts                        # 保留为项目说明或统一入口
 ├── package.json
@@ -492,7 +492,23 @@ logs/2026-07-24 18-30-55.545.log
 
 第一阶段虽然只实现添加 LP，但后续实现取消仓位时必须遵循 Aqua 的真实协议语义。这里的“取消仓位”对应 Aqua 的 `dock` 操作，不是传统 AMM 的赎回或提币操作。
 
-### 11.1 仓位发现接口
+### 11.1 当前优先实现：一键取消全部活跃 LP 脚本
+
+由于需要先验证真实关闭链路，当前优先于添加 LP 实现 `scripts/cancel-all-active-lp.ts`。该脚本不读取 JSONC 仓位配置，而是复用加密私钥和 `RPC_URL`，由当前 maker 钱包发现并串行关闭全部活跃仓位。
+
+脚本行为：
+
+1. 默认真实广播；`--dry-run` 只执行仓位查询、链上预检和 dock 模拟，不广播交易。
+2. 使用本文档定义的日志格式写入 `logs/YYYY-MM-DD HH-mm-ss.SSS.log`，所有记录均为中文 `[info]`。
+3. 对每个 API 仓位校验 maker、chainId、地址、完整 token 列表，以及 `strategyHash = keccak256(strategyBytes)`。
+4. 使用仓位返回的原始 `app` 构建 dock，避免用固定 router 地址覆盖仓位创建时的 app。
+5. 在广播前读取每个 token 的 `rawBalances` 并使用 `eth_call` 模拟 dock。
+6. 串行关闭，避免 nonce 竞争；任一仓位失败即停止后续仓位，保留已完成操作和失败原因日志。
+7. 每笔成功交易必须同时通过 receipt status、目标 `Docked` 事件和关闭后的 `rawBalances` 状态复核。
+8. 只关闭仓位，不撤销 ERC20 allowance；撤销授权保留为独立后续操作。
+9. 当接口返回数量达到当前 `limit=100` 时立即失败，避免在未确认分页语义时仅关闭前 100 个仓位。
+
+### 11.2 仓位发现接口
 
 参考项目已确认 1inch Aqua 页面使用以下接口查询某个 maker 的策略：
 
@@ -526,7 +542,7 @@ GET /v2.0/aqua/v1.0/strategies/makers/{makerAddress}
 
 该接口属于 1inch 页面 API，不是 Aqua 合约的状态读取接口。实现时应复用统一的 API 认证和请求通道，并将其隔离在 `infra/` 的仓位查询适配器中，避免领域层依赖 HTTP 返回格式。
 
-### 11.2 链上实际操作
+### 11.3 链上实际操作
 
 关闭一个仓位只需要 maker 钱包发送一笔 Aqua registry 的 `dock` 交易：
 
@@ -540,7 +556,7 @@ const dockTx = aqua.dock({
 
 参数必须满足：
 
-- `app` 必须与创建仓位时注册的 AquaSwapVMRouter 地址一致。
+- `app` 必须与创建仓位时注册的原始 Aqua app 地址一致；当前集中流动性仓位通常是 AquaSwapVMRouter，但一键关闭脚本必须使用策略接口返回并经链上预检确认的原始 app。
 - `strategyHash` 必须是目标仓位的真实 hash，优先从策略查询接口的 `strategyHash` 获取；也可由完整 `strategyBytes` 重新计算 `keccak256` 得到。
 - `tokens` 必须包含该策略创建时的全部 token，数量和 token 集合不能缺失。只传一个 token 或传错 token 会触发合约校验失败。
 - 交易发送者必须是该策略的 maker 钱包。
@@ -548,7 +564,7 @@ const dockTx = aqua.dock({
 
 Aqua 合约的实现会对每个 token 将策略虚拟余额设置为 `0`，并把其状态标记为 docked，然后发出 `Docked(maker, app, strategyHash)` 事件。关闭不产生 `Pulled` 事件；`Pulled` 表示 Aqua 应用在交易成交过程中从 maker 钱包拉取代币，不能用作 dock 成功标志。
 
-### 11.3 资金和授权行为
+### 11.4 资金和授权行为
 
 - Aqua 不托管 maker 的 ERC20。代币在仓位存续期间也一直留在 maker 钱包中，只有成交时才会由 Aqua 应用通过 allowance 从钱包转出。
 - 因此 `dock` 不会把代币转回钱包，也没有“取回剩余 LP 代币”的步骤。
@@ -557,7 +573,7 @@ Aqua 合约的实现会对每个 token 将策略虚拟余额设置为 `0`，并�
 - 如果用户希望彻底停止相关 Aqua 应用继续使用钱包资产，还需要单独发送 ERC20 `approve(spender, 0)` 撤销授权。撤销授权是独立的风险控制操作，不应默认和 dock 绑定，避免影响同一钱包中其他仍在使用该授权的仓位。
 - 当前项目采用最大授权策略，因此后续必须提供“关闭仓位”和“撤销授权”两个明确分开的操作入口，并在日志中清楚区分二者。
 
-### 11.4 关闭后的验证
+### 11.5 关闭后的验证
 
 发送 dock 后必须等待交易 receipt，并同时完成：
 
@@ -566,7 +582,7 @@ Aqua 合约的实现会对每个 token 将策略虚拟余额设置为 `0`，并�
 3. 通过策略查询接口查询该仓位的状态，确认不再属于 `status=open` 结果；接口更新存在延迟时，必须记录查询时间和待确认状态，不能伪报 API 已同步。
 4. 如实现链上只读复核，可查询目标 token 的 Aqua raw balance，确认已进入 docked/inactive 状态，而不能只依据本地交易发送成功。
 
-### 11.5 与调整仓位的关系
+### 11.6 与调整仓位的关系
 
 Aqua 策略配置是不可变的。`dock` 后旧策略 hash 会被永久标记为关闭，不能使用相同的 `strategyHash` 原地重开。修改费率、价格区间或投入配置时，必须生成不同的 strategy bytes 和新的 strategy hash，流程应为：
 
@@ -576,7 +592,7 @@ dock 旧策略 -> 等待确认 -> 构建新的 strategy bytes/hash -> 必要时�
 
 因为代币没有从钱包转入 Aqua，dock 后不需要做资金提现或再次充值。新策略是否继续使用同一钱包的最大 allowance，应由新策略的 token 集合和授权状态决定。
 
-### 11.6 依据与可信级别
+### 11.7 依据与可信级别
 
 - [Aqua 官方合约 `src/Aqua.sol`](https://github.com/1inch/aqua/blob/main/src/Aqua.sol)：`dock` 将各 token 的虚拟余额清零并标记为 docked，只发出 `Docked`；`pull` 才会执行 ERC20 `transferFrom` 并发出 `Pulled`。
 - [Aqua 官方 README](https://github.com/1inch/aqua/blob/main/README.md)：说明关闭策略使用 `dock`，以及 dock 后虚拟余额被移除。
