@@ -15,7 +15,7 @@ import {
   HexString,
   NetworkEnum,
 } from "@1inch/aqua-sdk";
-import { createTransport, request, type Transport } from "wreq-js";
+import { createTransport, request, type Transport as WreqTransport } from "wreq-js";
 import {
   createPublicClient,
   createWalletClient,
@@ -23,9 +23,11 @@ import {
   http,
   isAddress,
   type Address as ViemAddress,
+  type Chain,
   type Hex,
+  type Transport as ViemTransport,
 } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "./encrypt-private-key.ts";
 
 const ENV_FILE = ".env";
@@ -148,7 +150,7 @@ function createApiHeaders(token?: string): Record<string, string> {
  * 从 1inch 网页端认证接口获取本次查询使用的 Bearer token。
  * 关闭脚本只查询一次仓位列表，因此不需要跨运行缓存 token。
  */
-async function getAuthToken(transport: Transport): Promise<string> {
+async function getAuthToken(transport: WreqTransport): Promise<string> {
   const response = await request({
     url: `${PROXY_API_BASE}/auth/token`,
     transport,
@@ -171,7 +173,7 @@ async function getAuthToken(transport: Transport): Promise<string> {
  * API 返回刚好达到 limit 时不能证明已取全，因此直接失败，避免一键关闭只处理部分仓位。
  */
 async function getOpenStrategies(
-  transport: Transport,
+  transport: WreqTransport,
   token: string,
   maker: ViemAddress,
   chainId: number,
@@ -351,20 +353,43 @@ async function verifyDockedRawBalances(
 }
 
 /**
+ * 本地签名并通过 eth_sendRawTransaction 广播交易。
+ * 绝不能把裸地址作为 account 传给 viem，否则会退化为要求 RPC 节点代签的 eth_sendTransaction。
+ */
+export async function sendLocallySignedTransaction(
+  account: PrivateKeyAccount,
+  chain: Chain,
+  transport: ViemTransport,
+  transaction: {
+    to: ViemAddress;
+    data: Hex;
+    value: bigint;
+    nonce?: number;
+    gas?: bigint;
+    maxFeePerGas?: bigint;
+    maxPriorityFeePerGas?: bigint;
+  },
+): Promise<Hex> {
+  const walletClient = createWalletClient({ account, chain, transport });
+  return walletClient.sendTransaction(transaction);
+}
+
+/**
  * 逐个关闭策略，串行执行避免连续 wallet 交易产生 nonce 竞争。
  * dry-run 仍执行完整的 API、链上预检和 eth_call 模拟，但绝不广播交易。
  */
 async function cancelStrategy(
   strategy: MakerStrategy,
   publicClient: ReturnType<typeof createPublicClient>,
-  walletClient: ReturnType<typeof createWalletClient>,
   registry: ViemAddress,
-  maker: ViemAddress,
+  account: PrivateKeyAccount,
   chainId: number,
-  chain: ReturnType<typeof defineChain>,
+  chain: Chain,
+  rpcUrl: string,
   dryRun: boolean,
   logger: Logger,
 ): Promise<void> {
+  const maker = account.address;
   const { app, strategyHash, tokens } = validateStrategy(strategy, maker, chainId);
   logger.info(`开始处理仓位 strategyHash=${strategyHash}，app=${app}，代币数=${tokens.length}`);
   await verifyActiveRawBalances(publicClient, registry, maker, app, strategyHash, tokens, logger);
@@ -388,13 +413,18 @@ async function cancelStrategy(
     return;
   }
 
-  const transactionHash = await walletClient.sendTransaction({
-    account: maker,
-    chain,
-    to,
-    data,
-    value: dockTx.value,
-  });
+  let transactionHash: Hex;
+  try {
+    transactionHash = await sendLocallySignedTransaction(account, chain, http(rpcUrl), {
+      to,
+      data,
+      value: dockTx.value,
+    });
+  } catch (error) {
+    // viem 的完整错误可能包含 RPC URL 和 calldata；日志只保留首行可复盘原因，避免扩散敏感 RPC 信息。
+    const reason = error instanceof Error ? error.message.split("\n")[0]?.trim() : "未知 RPC 错误";
+    throw new Error(`dock 本地签名广播失败：${reason || "未知 RPC 错误"}`);
+  }
   logger.info(`dock 交易已广播：strategyHash=${strategyHash}，交易哈希=${transactionHash}`);
   const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 });
   logger.info(`dock 交易已确认：strategyHash=${strategyHash}，状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
@@ -451,7 +481,6 @@ async function main(): Promise<void> {
       rpcUrls: { default: { http: [rpcUrl] } },
     });
     const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
-    const walletClient = createWalletClient({ account, chain, transport: http(rpcUrl) });
 
     const network = chainId as NetworkEnum;
     const registryFromSdk = AQUA_CONTRACT_ADDRESSES[network];
@@ -482,7 +511,7 @@ async function main(): Promise<void> {
         throw new Error(`读取第 ${index + 1} 个仓位时发生意外空值`);
       }
       logger.info(`处理第 ${index + 1}/${strategies.length} 个活跃仓位`);
-      await cancelStrategy(strategy, publicClient, walletClient, registry, maker, chainId, chain, dryRun, logger);
+      await cancelStrategy(strategy, publicClient, registry, account, chainId, chain, rpcUrl, dryRun, logger);
     }
 
     logger.info(`${dryRun ? "dry-run 校验完成" : "全部活跃 LP 仓位已关闭"}，仓位数量=${strategies.length}`);

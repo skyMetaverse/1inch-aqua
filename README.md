@@ -49,6 +49,8 @@ try {
 
 脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
 
+交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。因此应使用支持标准 raw transaction 广播的 RPC。
+
 `.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC：
 
 ```dotenv
@@ -75,6 +77,12 @@ bun run cancel-all-active-lp
 
 ```bash
 bun run cancel-all-active-lp --help
+```
+
+运行回归测试：
+
+```bash
+bun test
 ```
 
 ## 运行

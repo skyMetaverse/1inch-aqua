@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "encrypt-private-key": "bun run scripts/encrypt-private-key.ts",
-    "cancel-all-active-lp": "bun run scripts/cancel-all-active-lp.ts"
+    "cancel-all-active-lp": "bun run scripts/cancel-all-active-lp.ts",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "1.3.5"

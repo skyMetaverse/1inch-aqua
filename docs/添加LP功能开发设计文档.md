@@ -503,10 +503,11 @@ logs/2026-07-24 18-30-55.545.log
 3. 对每个 API 仓位校验 maker、chainId、地址、完整 token 列表，以及 `strategyHash = keccak256(strategyBytes)`。
 4. 使用仓位返回的原始 `app` 构建 dock，避免用固定 router 地址覆盖仓位创建时的 app。
 5. 在广播前读取每个 token 的 `rawBalances` 并使用 `eth_call` 模拟 dock。
-6. 串行关闭，避免 nonce 竞争；任一仓位失败即停止后续仓位，保留已完成操作和失败原因日志。
-7. 每笔成功交易必须同时通过 receipt status、目标 `Docked` 事件和关闭后的 `rawBalances` 状态复核。
-8. 只关闭仓位，不撤销 ERC20 allowance；撤销授权保留为独立后续操作。
-9. 当接口返回数量达到当前 `limit=100` 时立即失败，避免在未确认分页语义时仅关闭前 100 个仓位。
+6. 使用解密私钥派生的本地 `PrivateKeyAccount` 签名，通过 RPC 的 `eth_sendRawTransaction` 广播；禁止将裸 maker 地址作为账户传给 `viem`，以免错误调用节点代签的 `eth_sendTransaction`。
+7. 串行关闭，避免 nonce 竞争；任一仓位失败即停止后续仓位，保留已完成操作和失败原因日志。
+8. 每笔成功交易必须同时通过 receipt status、目标 `Docked` 事件和关闭后的 `rawBalances` 状态复核。
+9. 只关闭仓位，不撤销 ERC20 allowance；撤销授权保留为独立后续操作。
+10. 当接口返回数量达到当前 `limit=100` 时立即失败，避免在未确认分页语义时仅关闭前 100 个仓位。
 
 ### 11.2 仓位发现接口
 
