@@ -23,7 +23,7 @@
 7. 调用 EMSH 的 `current` 接口获取本次创建使用的实时价格。
 8. 使用无损定点整数运算计算价格区间。
 9. 构建 Aqua 集中流动性策略和 `ship` 交易。
-10. 必要时发送 ERC20 `approve` 交易并等待确认。
+10. 必要时按代币兼容规则发送最大值 ERC20 `approve` 交易并等待确认。
 11. 发送 `ship` 交易并等待确认。
 12. 将完整过程写入本次运行专属日志文件。
 
@@ -69,7 +69,7 @@
 │   │   ├── rpc.ts                  # RPC 客户端和交易确认
 │   │   └── logger.ts                # 统一中文日志与运行日志文件
 │   ├── aqua/
-│   │   └── strategy.ts             # Aqua 策略、approve、ship 构建适配
+│   │   └── strategy.ts             # Aqua 策略、最大授权、ship 构建适配
 │   └── wallet/
 │       └── private-key.ts          # 复用现有解密模块并管理敏感 Buffer 生命周期
 ├── scripts/
@@ -312,7 +312,7 @@ formatFixed(value, scale)
 13. 在日志中输出完整交易预览。
 14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata。
 15. 查询两个代币对 Aqua registry 的 allowance。
-16. allowance 不足时发送 ERC20 approve，并等待成功回执。
+16. allowance 不是最大值时，按代币兼容规则发送最大值授权，并等待每笔授权成功回执。
 17. 发送 ship 交易并等待成功回执。
 18. 输出交易哈希、区块号、策略哈希、投入数量、价格和区间。
 19. 清理敏感 Buffer，记录本次运行结果。
@@ -328,10 +328,24 @@ formatFixed(value, scale)
 ### 7.1 授权策略
 
 - spender 固定为当前链 Aqua registry 地址，地址来自 SDK 常量或经校验的配置适配器。
-- allowance 足够时不发送 approve。
-- allowance 不足时只授权本次实际投入数量，除非后续需求明确改为最大授权。
-- approve 回执必须成功后才能发送 ship。
-- approve 失败或回滚时不得继续发送 ship。
+- 授权目标固定为 ERC20 `uint256` 最大值：`2^256 - 1`，即 `0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff`。
+- 每个代币都先查询 `allowance(wallet, aquaRegistry)`；仅当 allowance 已等于最大值时跳过授权。即使 allowance 已覆盖本次投入数量但不是最大值，仍按本需求更新为最大值。
+- 标准 ERC20 且当前 allowance 为零时，直接发送一笔 `approve(aquaRegistry, MAX_UINT256)`。
+- Ethereum 主网 USDT（`0xdAC17F958D2ee523a2206206994597C13D831ec7`）属于非标准授权代币：当当前 allowance 非零且不是最大值时，直接设置新的非零 allowance 会 revert。因此必须严格按以下顺序执行：
+  1. 发送 `approve(aquaRegistry, 0)`。
+  2. 等待该清零交易成功确认。
+  3. 再发送 `approve(aquaRegistry, MAX_UINT256)`。
+  4. 等待最大值授权交易成功确认，并重新查询 allowance，确认其等于最大值。
+- 对 USDT 当前 allowance 为零的情形，只需发送最大值授权，无需额外清零交易。
+- 第一阶段将此兼容规则显式限定为已确认的 Ethereum 主网 USDT 地址。其他链的 USDT、其他代币或代理升级后的行为，必须在实现时通过真实合约代码或模拟调用确认后才可加入相应规则；不能根据 symbol 猜测。
+- 任一 approve 或 allowance 复查失败、回滚、超时，均不得发送 ship。
+- 最大授权会允许 Aqua registry 在用户后续持有该代币时持续使用该代币额度。这是本需求明确选择的授权策略，日志和 README 必须对此风险作出清晰提示，并在后续迭代提供撤销授权脚本。
+
+本规则的外部依据：
+
+- [Tether USDT 已验证源码 `TetherToken.sol`](https://github.com/tethercoin/USDT/blob/main/TetherToken.sol)：`approve` 要求旧 allowance 非零时，新的非零授权必须先清零。
+- [Ethereum 主网 USDT Etherscan 合约源码](https://etherscan.io/address/0xdac17f958d2ee523a2206206994597c13d831ec7#code)：用于核对当前主网地址的已验证合约代码。
+- [OpenZeppelin `SafeERC20.forceApprove`](https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.5.0/contracts/token/ERC20/utils/SafeERC20.sol)：针对 USDT 类代币提供先尝试直接授权，失败后清零再设置目标额度的兼容思路；本项目第一阶段采用更明确、可审计的 allowance 分支流程。
 
 ### 7.2 交易确认
 
@@ -393,7 +407,8 @@ logs/2026-07-24 18-30-55.545.log
 - chain ID、脱敏 RPC 主机和钱包地址。
 - token symbol、地址、配置顺序和链上 decimals。
 - 配置的余额百分比、raw balance、可读余额和最终投入 raw amount。
-- allowance 查询结果和是否需要 approve。
+- allowance 查询结果、是否已为最大值授权，以及本次采用的授权兼容规则。
+- 每笔清零授权和最大值授权的 token、spender、目标额度、交易 hash、receipt 状态、区块号和确认耗时。
 - EMSH current 请求参数、请求开始/结束时间、接口耗时、返回价格和接口时间戳。
 - current 价格的用户方向、Aqua 内部方向和精度。
 - `mode`、上下浮动百分比、用户可读区间、raw price 区间。
@@ -430,7 +445,7 @@ logs/2026-07-24 18-30-55.545.log
 - 投入 raw amount 大于零且不超过余额。
 - `priceMin < priceMax` 且价格均大于零。
 - strategy 构建成功。
-- allowance 和 approve 状态确认。
+- allowance 最大值状态、USDT 清零后再授权流程和每笔 approve 回执确认。
 
 所有失败都必须在发送下一笔交易前停止。多 position 执行策略应在实现前明确：第一阶段默认任一 position 失败即停止后续 position，避免部分成功后继续消耗资产；后续如需“失败后继续”再增加显式配置。
 
@@ -453,6 +468,8 @@ logs/2026-07-24 18-30-55.545.log
 ### 10.2 集成测试
 
 - 使用 mock RPC 验证 `decimals`、`balanceOf`、`allowance` 调用。
+- 验证标准 ERC20 的零 allowance 直接最大值授权、已最大值授权跳过，以及非最大值授权更新路径。
+- 验证 Ethereum 主网 USDT 的零 allowance 直接最大值授权、非零 allowance 先清零确认再最大值授权，以及任一步失败时不发送 ship。
 - 模拟 approve 成功、失败、回滚和超时。
 - 模拟 ship 成功、失败、回滚和超时。
 - 模拟 EMSH current 返回正常、空值、零值、负值、非法格式和过期时间戳。
@@ -467,7 +484,7 @@ logs/2026-07-24 18-30-55.545.log
 1. 只读 RPC 查询验证。
 2. 小额测试钱包验证。
 3. 交易预览日志人工复核。
-4. approve 和 ship 的回执验证。
+4. 标准 ERC20 最大授权、Ethereum 主网 USDT 清零后最大授权以及 ship 的回执验证。
 5. 链上策略页面费率与配置值核对。
 6. 日志中的 current 价格、计算区间和链上结果复盘。
 
@@ -494,6 +511,7 @@ logs/2026-07-24 18-30-55.545.log
 3. EMSH 返回价格的字符串/数字类型和最大有效小数位；如服务端返回 JSON number，必须确认其是否已经产生精度损耗，并决定是否需要原始响应通道或服务端提供字符串字段。
 4. 当前安装的 Aqua SDK 对费率内部精度、最小值和最大值的真实编码边界。
 5. 所有目标链的 Aqua registry 和 SwapVM router 地址。
-6. RPC 是否支持交易回执等待、链 ID 查询和必要的 eth_call。
+6. 非 Ethereum 主网 USDT 或其他非标准 ERC20 的最大授权兼容规则及其合约行为。
+7. RPC 是否支持交易回执等待、链 ID 查询和必要的 eth_call。
 
 未确认前不应把示例返回值当作稳定接口契约，也不应广播真实资产交易。
