@@ -488,7 +488,68 @@ logs/2026-07-24 18-30-55.545.log
 5. 链上策略页面费率与配置值核对。
 6. 日志中的 current 价格、计算区间和链上结果复盘。
 
-## 11. 后续迭代方向
+## 11. 取消/关闭仓位调研结论
+
+第一阶段虽然只实现添加 LP，但后续实现取消仓位时必须遵循 Aqua 的真实协议语义。这里的“取消仓位”对应 Aqua 的 `dock` 操作，不是传统 AMM 的赎回或提币操作。
+
+### 11.1 链上实际操作
+
+关闭一个仓位只需要 maker 钱包发送一笔 Aqua registry 的 `dock` 交易：
+
+```typescript
+const dockTx = aqua.dock({
+  app: new Address(originalApp),
+  strategyHash: new HexString(strategyHash),
+  tokens: [new Address(token0), new Address(token1)]
+})
+```
+
+参数必须满足：
+
+- `app` 必须与创建仓位时注册的 AquaSwapVMRouter 地址一致。
+- `strategyHash` 必须是目标仓位的真实 hash，优先从策略查询接口的 `strategyHash` 获取；也可由完整 `strategyBytes` 重新计算 `keccak256` 得到。
+- `tokens` 必须包含该策略创建时的全部 token，数量和 token 集合不能缺失。只传一个 token 或传错 token 会触发合约校验失败。
+- 交易发送者必须是该策略的 maker 钱包。
+- `dock` 的 `value` 为 `0`，不需要发送原生币作为业务金额；仍需支付链上 gas。
+
+Aqua 合约的实现会对每个 token 将策略虚拟余额设置为 `0`，并把其状态标记为 docked，然后发出 `Docked(maker, app, strategyHash)` 事件。关闭不产生 `Pulled` 事件；`Pulled` 表示 Aqua 应用在交易成交过程中从 maker 钱包拉取代币，不能用作 dock 成功标志。
+
+### 11.2 资金和授权行为
+
+- Aqua 不托管 maker 的 ERC20。代币在仓位存续期间也一直留在 maker 钱包中，只有成交时才会由 Aqua 应用通过 allowance 从钱包转出。
+- 因此 `dock` 不会把代币转回钱包，也没有“取回剩余 LP 代币”的步骤。
+- `dock` 本身不需要 ERC20 approve，也不需要先把 Aqua registry allowance 设为零。
+- 关闭仓位后，原策略不能继续成交；但 ERC20 allowance 仍然可能保留。
+- 如果用户希望彻底停止相关 Aqua 应用继续使用钱包资产，还需要单独发送 ERC20 `approve(spender, 0)` 撤销授权。撤销授权是独立的风险控制操作，不应默认和 dock 绑定，避免影响同一钱包中其他仍在使用该授权的仓位。
+- 当前项目采用最大授权策略，因此后续必须提供“关闭仓位”和“撤销授权”两个明确分开的操作入口，并在日志中清楚区分二者。
+
+### 11.3 关闭后的验证
+
+发送 dock 后必须等待交易 receipt，并同时完成：
+
+1. receipt status 为成功。
+2. 解析交易日志，确认目标 Aqua registry 发出 `Docked`，且 maker、app、strategyHash 与目标一致。
+3. 通过策略查询接口查询该仓位的状态，确认不再属于 `status=open` 结果；接口更新存在延迟时，必须记录查询时间和待确认状态，不能伪报 API 已同步。
+4. 如实现链上只读复核，可查询目标 token 的 Aqua raw balance，确认已进入 docked/inactive 状态，而不能只依据本地交易发送成功。
+
+### 11.4 与调整仓位的关系
+
+Aqua 策略配置是不可变的。`dock` 后旧策略 hash 会被永久标记为关闭，不能使用相同的 `strategyHash` 原地重开。修改费率、价格区间或投入配置时，必须生成不同的 strategy bytes 和新的 strategy hash，流程应为：
+
+```text
+dock 旧策略 -> 等待确认 -> 构建新的 strategy bytes/hash -> 必要时补充/复用授权 -> ship 新策略
+```
+
+因为代币没有从钱包转入 Aqua，dock 后不需要做资金提现或再次充值。新策略是否继续使用同一钱包的最大 allowance，应由新策略的 token 集合和授权状态决定。
+
+### 11.5 官方依据
+
+- [Aqua 官方合约 `src/Aqua.sol`](https://github.com/1inch/aqua/blob/main/src/Aqua.sol)：`dock` 将各 token 的虚拟余额清零并标记为 docked，只发出 `Docked`；`pull` 才会执行 ERC20 `transferFrom` 并发出 `Pulled`。
+- [Aqua 官方 README](https://github.com/1inch/aqua/blob/main/README.md)：说明关闭策略使用 `dock`，以及 dock 后虚拟余额被移除。
+- [Aqua 官方 TypeScript SDK 文档](https://business.1inch.com/portal/documentation/sdks/aqua-sdk)：说明 `dock` 参数为 `app`、`strategyHash` 和完整 token 列表，并提供关闭策略示例。
+- [1inch Aqua 官方“Manage & close”说明](https://1inch.com/aqua/learn/manage-close)：说明关闭是清除策略配置的一笔交易，不移动代币；撤销 allowance 是另一个用于停止所有新成交的操作。
+
+## 12. 后续迭代方向
 
 目录规划为以下迭代保留扩展点：
 
@@ -502,7 +563,7 @@ logs/2026-07-24 18-30-55.545.log
 
 后续扩展必须遵守：领域计算不依赖网络，第三方接口通过适配器隔离，交易发送必须经过统一编排和日志审计。
 
-## 12. 实现前待确认项
+## 13. 实现前待确认项
 
 以下内容必须在编码时通过真实代码或真实请求确认：
 
