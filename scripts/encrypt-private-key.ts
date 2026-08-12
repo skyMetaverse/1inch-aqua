@@ -10,11 +10,16 @@ import { StringDecoder } from "node:string_decoder";
 
 const ENV_FILE = ".env";
 const ENV_FIELD = "ENCRYPTED_PRIVATE_KEY";
-const FORMAT_HEADER = Buffer.from([0x41, 0x51, 0x50, 0x01]);
+const FORMAT_MAGIC = Buffer.from([0x41, 0x51, 0x50]);
+const FORMAT_VERSION_V1 = 0x01;
+const FORMAT_VERSION_V2 = 0x02;
+const FORMAT_HEADER_LENGTH = FORMAT_MAGIC.length + 1;
 const SALT_LENGTH = 16;
 const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
 const DERIVED_KEY_LENGTH = 32;
+const SCRYPT_V1_OPTIONS = { N: 32_768, r: 8, p: 1, maxmem: 128 * 1024 * 1024 };
+const SCRYPT_V2_OPTIONS = { N: 131_072, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_INDEX = new Map([...BASE58_ALPHABET].map((character, index) => [character, index]));
 
@@ -81,16 +86,12 @@ async function readHidden(prompt: string): Promise<string> {
 }
 
 /**
- * 使用固定且足够高成本的 scrypt 参数从密码派生 AES-256 密钥。
- * 每份密文携带独立 salt，防止相同密码产生可关联的派生密钥。
+ * 根据密文版本使用对应的 scrypt 参数派生 AES-256 密钥。
+ * v2 使用 OWASP 建议的 N=2^17、r=8、p=1；保留 v1 是为了能解密已生成的旧密文。
  */
-function deriveKey(password: Buffer, salt: Buffer): Buffer {
-  return scryptSync(password, salt, DERIVED_KEY_LENGTH, {
-    N: 32_768,
-    r: 8,
-    p: 1,
-    maxmem: 128 * 1024 * 1024,
-  });
+function deriveKey(password: Buffer, salt: Buffer, version: number): Buffer {
+  const options = version === FORMAT_VERSION_V1 ? SCRYPT_V1_OPTIONS : SCRYPT_V2_OPTIONS;
+  return scryptSync(password, salt, DERIVED_KEY_LENGTH, options);
 }
 
 /**
@@ -149,18 +150,18 @@ function decodeBase58(encoded: string): Buffer {
 }
 
 /**
- * 将 salt、IV、认证标签与密文封装为带版本头的二进制数据，便于将来安全扩展格式。
+ * 将 salt、IV、认证标签与密文封装为 v2 格式，便于将来安全扩展且每次加密都有独立随机数据。
  */
 function encryptPrivateKey(privateKey: Buffer, password: Buffer): string {
   const salt = randomBytes(SALT_LENGTH);
   const iv = randomBytes(IV_LENGTH);
-  const derivedKey = deriveKey(password, salt);
+  const derivedKey = deriveKey(password, salt, FORMAT_VERSION_V2);
 
   try {
     const cipher = createCipheriv("aes-256-gcm", derivedKey, iv);
     const ciphertext = Buffer.concat([cipher.update(privateKey), cipher.final()]);
     const authTag = cipher.getAuthTag();
-    return encodeBase58(Buffer.concat([FORMAT_HEADER, salt, iv, authTag, ciphertext]));
+    return encodeBase58(Buffer.concat([FORMAT_MAGIC, Buffer.from([FORMAT_VERSION_V2]), salt, iv, authTag, ciphertext]));
   } finally {
     // 派生密钥仅用于本次操作，尽早覆盖 Buffer 中的敏感内容。
     derivedKey.fill(0);
@@ -168,17 +169,22 @@ function encryptPrivateKey(privateKey: Buffer, password: Buffer): string {
 }
 
 /**
- * 校验二进制格式后执行 AES-GCM 解密；认证失败统一提示，避免暴露密码或密文细节。
+ * 校验二进制格式后执行 AES-GCM 解密；v1、v2 均可读取，认证失败统一提示以避免暴露密码或密文细节。
  */
 function decryptPrivateKey(encryptedPrivateKey: string, password: Buffer): Buffer {
   const payload = decodeBase58(encryptedPrivateKey);
-  const minimumLength = FORMAT_HEADER.length + SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH + 1;
+  const minimumLength = FORMAT_HEADER_LENGTH + SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH + 1;
+  const version = payload[FORMAT_MAGIC.length];
 
-  if (payload.length < minimumLength || !payload.subarray(0, FORMAT_HEADER.length).equals(FORMAT_HEADER)) {
+  if (
+    payload.length < minimumLength ||
+    !payload.subarray(0, FORMAT_MAGIC.length).equals(FORMAT_MAGIC) ||
+    (version !== FORMAT_VERSION_V1 && version !== FORMAT_VERSION_V2)
+  ) {
     throw new Error("加密私钥格式不受支持或已损坏");
   }
 
-  const saltStart = FORMAT_HEADER.length;
+  const saltStart = FORMAT_HEADER_LENGTH;
   const ivStart = saltStart + SALT_LENGTH;
   const tagStart = ivStart + IV_LENGTH;
   const ciphertextStart = tagStart + AUTH_TAG_LENGTH;
@@ -186,7 +192,7 @@ function decryptPrivateKey(encryptedPrivateKey: string, password: Buffer): Buffe
   const iv = payload.subarray(ivStart, tagStart);
   const authTag = payload.subarray(tagStart, ciphertextStart);
   const ciphertext = payload.subarray(ciphertextStart);
-  const derivedKey = deriveKey(password, salt);
+  const derivedKey = deriveKey(password, salt, version);
 
   try {
     const decipher = createDecipheriv("aes-256-gcm", derivedKey, iv);
@@ -223,7 +229,10 @@ function writeEncryptedPrivateKey(encryptedPrivateKey: string): void {
     encoding: "utf8",
     mode: 0o600,
   });
-  chmodSync(ENV_FILE, 0o600);
+  // Windows 不采用 POSIX 权限位，文件访问保护由创建目录及文件的 NTFS ACL 决定。
+  if (process.platform !== "win32") {
+    chmodSync(ENV_FILE, 0o600);
+  }
 }
 
 /**
