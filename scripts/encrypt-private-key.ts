@@ -1,7 +1,7 @@
 /**
- * 私钥加密脚本：交互式读取不回显的私钥与密码，使用 scrypt 和 AES-256-GCM 加密后写入 .env。
- * 核心功能：加密结果以 Base58 保存到 ENCRYPTED_PRIVATE_KEY；decrypt 子命令可验证并读取该密文。
- * 主要流程：TTY 隐藏输入 -> 派生密钥 -> 加密/解密 -> 安全写入或读取 .env。
+ * 私钥加密模块：交互式读取不回显的私钥与密码，使用 scrypt 和 AES-256-GCM 加密后写入 .env。
+ * 核心功能：命令行主动加密；导出 getDecryptedPrivateKey() 供其他程序在内存中取得解密后的私钥。
+ * 主要流程：TTY 隐藏输入 -> 格式校验 -> 派生密钥 -> 加密/解密 -> 安全写入或内存返回。
  */
 
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
@@ -11,15 +11,16 @@ import { StringDecoder } from "node:string_decoder";
 const ENV_FILE = ".env";
 const ENV_FIELD = "ENCRYPTED_PRIVATE_KEY";
 const FORMAT_MAGIC = Buffer.from([0x41, 0x51, 0x50]);
-const FORMAT_VERSION_V1 = 0x01;
-const FORMAT_VERSION_V2 = 0x02;
+const FORMAT_VERSION = 0x02;
 const FORMAT_HEADER_LENGTH = FORMAT_MAGIC.length + 1;
+const ETHEREUM_PRIVATE_KEY_PATTERN = /^(?:0x)?[0-9a-fA-F]{64}$/;
+const ETHEREUM_PRIVATE_KEY_MAX = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+const PASSWORD_MIN_LENGTH = 9;
 const SALT_LENGTH = 16;
 const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
 const DERIVED_KEY_LENGTH = 32;
-const SCRYPT_V1_OPTIONS = { N: 32_768, r: 8, p: 1, maxmem: 128 * 1024 * 1024 };
-const SCRYPT_V2_OPTIONS = { N: 131_072, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
+const SCRYPT_OPTIONS = { N: 131_072, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_INDEX = new Map([...BASE58_ALPHABET].map((character, index) => [character, index]));
 
@@ -86,12 +87,42 @@ async function readHidden(prompt: string): Promise<string> {
 }
 
 /**
- * 根据密文版本使用对应的 scrypt 参数派生 AES-256 密钥。
- * v2 使用 OWASP 建议的 N=2^17、r=8、p=1；保留 v1 是为了能解密已生成的旧密文。
+ * 使用 OWASP 建议的 scrypt 参数派生 AES-256 密钥；较高内存成本用于抬高离线猜密成本。
  */
-function deriveKey(password: Buffer, salt: Buffer, version: number): Buffer {
-  const options = version === FORMAT_VERSION_V1 ? SCRYPT_V1_OPTIONS : SCRYPT_V2_OPTIONS;
-  return scryptSync(password, salt, DERIVED_KEY_LENGTH, options);
+function deriveKey(password: Buffer, salt: Buffer): Buffer {
+  return scryptSync(password, salt, DERIVED_KEY_LENGTH, SCRYPT_OPTIONS);
+}
+
+/**
+ * 校验 Ethereum 私钥必须是 32 字节十六进制数，并且落在 secp256k1 有效范围内。
+ * 统一输出带 0x 前缀的小写形式，避免同一私钥因输入写法不同产生不同明文格式。
+ */
+function validatePrivateKey(privateKey: string): string {
+  if (!ETHEREUM_PRIVATE_KEY_PATTERN.test(privateKey)) {
+    throw new Error("私钥格式错误：请输入 64 位十六进制 Ethereum 私钥，可带 0x 前缀");
+  }
+
+  const normalized = `0x${privateKey.replace(/^0x/i, "").toLowerCase()}`;
+  const numericValue = BigInt(normalized);
+  if (numericValue === 0n || numericValue >= ETHEREUM_PRIVATE_KEY_MAX) {
+    throw new Error("私钥数值无效：必须大于 0 且小于 secp256k1 曲线阶数");
+  }
+  return normalized;
+}
+
+/**
+ * 强制密码具备足够的字符多样性，降低字典猜测成功率；密码不接受空白字符以避免复制和终端输入歧义。
+ */
+function validatePassword(password: string): void {
+  if (Array.from(password).length < PASSWORD_MIN_LENGTH) {
+    throw new Error(`密码长度必须大于 8 位（至少 ${PASSWORD_MIN_LENGTH} 位）`);
+  }
+  if (!/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/[0-9]/.test(password) || !/[^a-zA-Z0-9]/.test(password)) {
+    throw new Error("密码必须同时包含小写字母、大写字母、数字和特殊字符");
+  }
+  if (/\s/.test(password)) {
+    throw new Error("密码不能包含空白字符");
+  }
 }
 
 /**
@@ -155,13 +186,13 @@ function decodeBase58(encoded: string): Buffer {
 function encryptPrivateKey(privateKey: Buffer, password: Buffer): string {
   const salt = randomBytes(SALT_LENGTH);
   const iv = randomBytes(IV_LENGTH);
-  const derivedKey = deriveKey(password, salt, FORMAT_VERSION_V2);
+  const derivedKey = deriveKey(password, salt);
 
   try {
     const cipher = createCipheriv("aes-256-gcm", derivedKey, iv);
     const ciphertext = Buffer.concat([cipher.update(privateKey), cipher.final()]);
     const authTag = cipher.getAuthTag();
-    return encodeBase58(Buffer.concat([FORMAT_MAGIC, Buffer.from([FORMAT_VERSION_V2]), salt, iv, authTag, ciphertext]));
+    return encodeBase58(Buffer.concat([FORMAT_MAGIC, Buffer.from([FORMAT_VERSION]), salt, iv, authTag, ciphertext]));
   } finally {
     // 派生密钥仅用于本次操作，尽早覆盖 Buffer 中的敏感内容。
     derivedKey.fill(0);
@@ -169,7 +200,7 @@ function encryptPrivateKey(privateKey: Buffer, password: Buffer): string {
 }
 
 /**
- * 校验二进制格式后执行 AES-GCM 解密；v1、v2 均可读取，认证失败统一提示以避免暴露密码或密文细节。
+ * 校验二进制格式后执行 AES-GCM 解密；仅接受当前 v2 格式，认证失败统一提示以避免暴露密码或密文细节。
  */
 function decryptPrivateKey(encryptedPrivateKey: string, password: Buffer): Buffer {
   const payload = decodeBase58(encryptedPrivateKey);
@@ -179,7 +210,7 @@ function decryptPrivateKey(encryptedPrivateKey: string, password: Buffer): Buffe
   if (
     payload.length < minimumLength ||
     !payload.subarray(0, FORMAT_MAGIC.length).equals(FORMAT_MAGIC) ||
-    (version !== FORMAT_VERSION_V1 && version !== FORMAT_VERSION_V2)
+    version !== FORMAT_VERSION
   ) {
     throw new Error("加密私钥格式不受支持或已损坏");
   }
@@ -192,7 +223,7 @@ function decryptPrivateKey(encryptedPrivateKey: string, password: Buffer): Buffe
   const iv = payload.subarray(ivStart, tagStart);
   const authTag = payload.subarray(tagStart, ciphertextStart);
   const ciphertext = payload.subarray(ciphertextStart);
-  const derivedKey = deriveKey(password, salt, version);
+  const derivedKey = deriveKey(password, salt);
 
   try {
     const decipher = createDecipheriv("aes-256-gcm", derivedKey, iv);
@@ -255,21 +286,18 @@ function readEncryptedPrivateKey(): string {
 }
 
 /**
- * 加密入口：要求两次输入相同密码，避免不可恢复地写入输错密码的密文。
+ * 主动加密入口：校验 Ethereum 私钥与强密码，并要求两次输入同一密码后才写入 .env。
  */
 async function runEncrypt(): Promise<void> {
-  const privateKey = Buffer.from(await readHidden("请输入私钥："), "utf8");
-  if (privateKey.length === 0) {
-    throw new Error("私钥不能为空");
-  }
-
-  const password = Buffer.from(await readHidden("请输入加密密码："), "utf8");
-  const passwordConfirmation = Buffer.from(await readHidden("请再次输入加密密码："), "utf8");
+  const normalizedPrivateKey = validatePrivateKey(await readHidden("请输入 Ethereum 私钥："));
+  const passwordText = await readHidden("请输入加密密码：");
+  const passwordConfirmationText = await readHidden("请再次输入加密密码：");
+  const privateKey = Buffer.from(normalizedPrivateKey, "utf8");
+  const password = Buffer.from(passwordText, "utf8");
+  const passwordConfirmation = Buffer.from(passwordConfirmationText, "utf8");
 
   try {
-    if (password.length === 0) {
-      throw new Error("加密密码不能为空");
-    }
+    validatePassword(passwordText);
     if (!password.equals(passwordConfirmation)) {
       throw new Error("两次输入的密码不一致");
     }
@@ -284,21 +312,21 @@ async function runEncrypt(): Promise<void> {
 }
 
 /**
- * 解密入口：密码读取保持不回显，并将解密出的私钥写到标准输出供人工确认或其他程序接收。
+ * 为其他程序提供解密后的私钥 Buffer；私钥只通过返回值驻留在调用进程内存中，不会打印或写入文件。
+ * 调用方应在不再使用时执行 privateKey.fill(0)，尽快清除其持有的敏感数据。
  */
-async function runDecrypt(): Promise<void> {
-  const password = Buffer.from(await readHidden("请输入解密密码："), "utf8");
+export async function getDecryptedPrivateKey(): Promise<Buffer> {
+  const passwordText = await readHidden("请输入解密密码：");
+  const password = Buffer.from(passwordText, "utf8");
 
   try {
-    if (password.length === 0) {
-      throw new Error("解密密码不能为空");
-    }
-
-    const privateKey = decryptPrivateKey(readEncryptedPrivateKey(), password);
+    validatePassword(passwordText);
+    const decryptedPrivateKey = decryptPrivateKey(readEncryptedPrivateKey(), password);
     try {
-      process.stdout.write(`${privateKey.toString("utf8")}\n`);
+      // 即使密文已通过认证，仍校验明文，确保调用方只能得到有效的 Ethereum 私钥。
+      return Buffer.from(validatePrivateKey(decryptedPrivateKey.toString("utf8")), "utf8");
     } finally {
-      privateKey.fill(0);
+      decryptedPrivateKey.fill(0);
     }
   } finally {
     password.fill(0);
@@ -306,24 +334,20 @@ async function runDecrypt(): Promise<void> {
 }
 
 /**
- * 根据子命令执行对应流程，默认加密以减少日常使用时的参数负担。
+ * 仅在直接执行该文件时触发主动加密；被其他程序导入时不产生副作用。
  */
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "encrypt";
-  if (command === "encrypt") {
-    await runEncrypt();
-    return;
+  if (command !== "encrypt") {
+    throw new Error("用法：bun run encrypt-private-key [encrypt]");
   }
-  if (command === "decrypt") {
-    await runDecrypt();
-    return;
-  }
-
-  throw new Error("用法：bun run encrypt-private-key [encrypt|decrypt]");
+  await runEncrypt();
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : "发生未知错误";
-  process.stderr.write(`操作失败：${message}\n`);
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "发生未知错误";
+    process.stderr.write(`操作失败：${message}\n`);
+    process.exitCode = 1;
+  });
+}
