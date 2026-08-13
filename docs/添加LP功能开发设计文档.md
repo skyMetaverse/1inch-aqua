@@ -319,7 +319,7 @@ formatFixed(value, scale)
 14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata；每次构建使用 SDK 支持的 `uint64` 加密随机 salt，避免相同参数与已关闭策略重用同一 hash。
 15. 查询两个代币对 Aqua registry 的 allowance。
 16. allowance 不是最大值时，按代币兼容规则发送最大值授权，并等待每笔授权成功回执。
-17. 当配置仓位数不超过 2 时逐笔发送 ship；超过 2 时，全部仓位完成 ship 模拟后，通过 JSON-RPC batch 提交多笔本地签名的独立 raw transaction，再逐笔等待成功回执。
+17. 当配置仓位数不超过 2 时逐笔发送 ship；超过 2 时，全部仓位完成 ship 模拟后，为每笔分配连续 nonce 并按 nonce 顺序流水线提交本地签名的独立 raw transaction，不等待前一笔区块确认，再逐笔等待成功回执。
 18. 输出交易哈希、区块号、策略哈希、投入数量、价格和区间。
 19. 清理敏感 Buffer，记录本次运行结果。
 
@@ -346,7 +346,7 @@ formatFixed(value, scale)
 - 该策略会让允许直接更新额度的标准 ERC20 在额度不足时多消耗一笔清零交易，但统一覆盖 USDT 类限制，且不依赖 token symbol、地址白名单或内部位宽猜测。
 - 任一 approve 或 allowance 复查失败、回滚、超时，均不得发送 ship。
 - 批量模式发送 ship 前重新按 token 合计所有待投入 raw amount，并与最新钱包余额比较；合计不足时整批不广播。
-- JSON-RPC batch 部分成功时记录所有成功 hash，禁止自动重发整批，避免重复创建策略。
+- 连续 nonce 流水线中任一 raw 交易广播失败时，记录此前所有成功 hash，停止提交后续 nonce；先完成成功前缀的 receipt、事件和余额复核，禁止自动重发，避免重复创建策略。
 - 最大授权会允许 Aqua registry 在用户后续持有该代币时持续使用该代币额度。这是本需求明确选择的授权策略，日志和 README 必须对此风险作出清晰提示，并在后续迭代提供撤销授权脚本。
 
 本规则的外部依据：

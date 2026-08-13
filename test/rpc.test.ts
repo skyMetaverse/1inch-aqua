@@ -54,6 +54,35 @@ test("批量本地签名交易使用连续 nonce 并返回每笔 hash", async ()
   expect(requests.some((request) => request.method === "eth_fillTransaction")).toBe(false);
 });
 
+test("流水线广播在中间 nonce 失败时不提交后续交易", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  let rawRequestCount = 0;
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<unknown> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0x9";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x3b9aca00";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" };
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_sendRawTransaction") {
+        rawRequestCount += 1;
+        if (rawRequestCount === 2) throw new Error("Missing or invalid parameters.");
+        return "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+      }
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  const results = await sendLocallySignedTransactions(testAccount, testChain, transport, [
+    { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x01", value: 0n },
+    { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x02", value: 0n },
+    { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x03", value: 0n },
+  ]);
+  expect(rawRequestCount).toBe(2);
+  expect(results[0]?.hash).toBe("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  expect(results[1]?.error).toBeDefined();
+  expect(results[2]?.error).toContain("未提交");
+});
+
 test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () => {
   const requests: Array<{ method: string; params?: unknown[] }> = [];
   const transport = custom({

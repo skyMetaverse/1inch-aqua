@@ -65,13 +65,13 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行会在本次投入尚未被现有 allowance 覆盖时尝试 `MAX_UINT256` 授权；确认后以链上实际回读的 allowance 是否覆盖本次投入为准。这样可兼容内部存储小于 `uint256` 或采用无限授权哨兵值的 ERC20。若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
 
-当配置中的仓位数超过 2 个时，脚本会先完成全部仓位的余额、价格、授权和 `ship` 模拟，再通过 JSON-RPC batch 一次提交多笔本地签名的 `eth_sendRawTransaction`。这会减少 RPC 往返，但链上仍是多笔独立交易，并逐笔等待回执、校验事件和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。批量提交部分成功时会记录已成功 hash，并禁止自动重发整批。
+当配置中的仓位数超过 2 个时，脚本会先完成全部仓位的余额、价格、授权和 `ship` 模拟，再为每笔 `ship` 分配连续 nonce 并按 nonce 顺序流水线提交本地签名的 `eth_sendRawTransaction`，不等待前一笔区块确认。这会减少“逐笔确认后再发送”的等待，但链上仍是多笔独立交易，并逐笔等待回执、校验事件和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。任一 raw 交易提交失败时停止后续 nonce；已成功 hash 会先完成复核，且不会自动重发。
 
 ## 一键取消全部活跃 LP 仓位
 
 脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
 
-交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。因此应使用支持标准 raw transaction 广播的 RPC。
+交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。多笔连续 nonce 交易也不依赖 RPC 的 JSON-RPC request batch 排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
 
 `.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC：
 

@@ -273,7 +273,7 @@ async function addPosition(parameters: {
     return undefined;
   }
   if (parameters.batchShip) {
-    logger.info(`ship 已准备：strategyHash=${built.strategyHash}，等待批量广播`);
+    logger.info(`ship 已准备：strategyHash=${built.strategyHash}，等待连续 nonce 流水线提交`);
     return { index: parameters.index, built, tokens: [token0, token1], amounts: [amount0, amount1] };
   }
 
@@ -323,9 +323,9 @@ async function verifyShipReceipt(parameters: {
 }
 
 /**
- * 批量提交已经完成模拟的 ship。
+ * 流水线提交已经完成模拟的 ship。
  * 发送前重新合计同一 token 的 raw 投入，避免多个仓位各自模拟成功但合计超过钱包余额。
- * JSON-RPC batch 可能部分成功；成功 hash 必须落日志，失败时禁止自动重发整批。
+ * 连续 nonce 广播可能部分成功；成功 hash 必须落日志，失败时禁止自动重发。
  */
 async function broadcastPreparedShips(parameters: {
   ships: readonly PreparedShip[];
@@ -353,16 +353,17 @@ async function broadcastPreparedShips(parameters: {
   const results = await sendLocallySignedTransactions(parameters.account, parameters.chain, http(parameters.rpcUrl, { batch: true }), parameters.ships.map((ship) => ship.built.ship));
   results.forEach((result, index) => {
     const ship = parameters.ships[index];
-    if (result.hash) parameters.logger.info(`批量 ship 已提交：第 ${(ship?.index ?? index) + 1} 个 LP，strategyHash=${ship?.built.strategyHash ?? "unknown"}，交易哈希=${result.hash}`);
-    if (result.error) parameters.logger.info(`批量 ship 提交失败：第 ${(ship?.index ?? index) + 1} 个 LP，原因=${result.error}`);
+    if (result.hash) parameters.logger.info(`流水线 ship 已提交：第 ${(ship?.index ?? index) + 1} 个 LP，strategyHash=${ship?.built.strategyHash ?? "unknown"}，交易哈希=${result.hash}`);
+    if (result.error) parameters.logger.info(`流水线 ship 提交失败：第 ${(ship?.index ?? index) + 1} 个 LP，原因=${result.error}`);
   });
-  const failures = results.flatMap((result, index) => result.error ? [`第 ${(parameters.ships[index]?.index ?? index) + 1} 个 LP 广播失败：${result.error}`] : []);
-  if (failures.length > 0) throw new Error(`批量 ship 部分失败：${failures.join("；")}；已成功 hash 已记录，禁止自动重发`);
-  await Promise.all(parameters.ships.map(async (ship, index) => {
+  const confirmed = await Promise.allSettled(parameters.ships.flatMap((ship, index) => {
     const hash = results[index]?.hash;
-    if (!hash) throw new Error(`第 ${ship.index + 1} 个 LP 未返回交易哈希`);
-    await verifyShipReceipt({ publicClient: parameters.publicClient, registry: parameters.registry, account: parameters.account, built: ship.built, tokens: ship.tokens, amounts: ship.amounts, hash, logger: parameters.logger, index: ship.index });
+    return hash ? [verifyShipReceipt({ publicClient: parameters.publicClient, registry: parameters.registry, account: parameters.account, built: ship.built, tokens: ship.tokens, amounts: ship.amounts, hash, logger: parameters.logger, index: ship.index })] : [];
   }));
+  const receiptFailures = confirmed.flatMap((result) => result.status === "rejected" ? [result.reason instanceof Error ? result.reason.message.split("\n")[0] : "已提交 ship 的回执或复核失败"] : []);
+  if (receiptFailures.length > 0) throw new Error(`流水线 ship 已提交交易复核失败：${receiptFailures.join("；")}`);
+  const failures = results.flatMap((result, index) => result.error ? [`第 ${(parameters.ships[index]?.index ?? index) + 1} 个 LP 广播失败：${result.error}`] : []);
+  if (failures.length > 0) throw new Error(`流水线 ship 部分失败：${failures.join("；")}；已成功交易已完成复核，禁止自动重发`);
 }
 
 async function main(): Promise<void> {
@@ -393,7 +394,7 @@ async function main(): Promise<void> {
     logger.info(`RPC 与 Aqua registry 校验成功：chainId=${rpcChainId}，registry=${registry}`);
 
     const batchShip = config.positions.length > 2;
-    if (batchShip && !dryRun) logger.info(`仓位数=${config.positions.length} > 2，启用 ship JSON-RPC 批量广播；链上仍为多笔独立交易`);
+    if (batchShip && !dryRun) logger.info(`仓位数=${config.positions.length} > 2，启用 ship 连续 nonce 流水线提交；链上仍为多笔独立交易`);
     const preparedShips: PreparedShip[] = [];
     for (const [index, position] of config.positions.entries()) {
       const prepared = await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger, batchShip });

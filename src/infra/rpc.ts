@@ -72,15 +72,16 @@ export async function sendLocallySignedTransaction(
       ? { maxFeePerGas: transaction.maxFeePerGas, maxPriorityFeePerGas: transaction.maxPriorityFeePerGas }
       : await publicClient.estimateFeesPerGas();
     const serialized = await signPreparedTransaction(account, chain, transaction, nonce, gas, fees);
-    return await publicClient.request({ method: "eth_sendRawTransaction", params: [serialized] });
+    return await publicClient.request({ method: "eth_sendRawTransaction", params: [serialized] }, { retryCount: 0 });
   } catch (error) {
     throw new Error(`本地签名交易准备或 raw 广播失败：${firstErrorLine(error)}`);
   }
 }
 
 /**
- * 为多笔独立交易分配连续 nonce 并本地签名，再通过同一 transport 提交 JSON-RPC batch。
- * 这里只合并 RPC 请求，不改变链上 msg.sender；approve/ship 的依赖顺序仍由调用方分批等待确认。
+ * 为多笔独立交易分配连续 nonce 并本地签名，再按 nonce 顺序流水线提交。
+ * 部分 RPC 支持 JSON-RPC request batch，却不会按数组顺序处理依赖 nonce 的 raw transaction；因此每笔收到 hash 后立即提交下一笔，但不等待区块确认。
+ * 任一 nonce 广播失败时停止后续提交，避免创建永远受前序 nonce 缺口阻塞的交易。
  */
 export async function sendLocallySignedTransactions(
   account: PrivateKeyAccount,
@@ -95,11 +96,22 @@ export async function sendLocallySignedTransactions(
     const fees = await publicClient.estimateFeesPerGas();
     const gasValues = await Promise.all(transactions.map((transaction) => transaction.gas ?? publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value })));
     const serialized = await Promise.all(transactions.map((transaction, index) => signPreparedTransaction(account, chain, transaction, transaction.nonce ?? startNonce + index, gasValues[index] ?? 0n, fees)));
-    const results = await Promise.allSettled(serialized.map((raw) => publicClient.request({ method: "eth_sendRawTransaction", params: [raw] })));
-    return results.map((result) => {
-      if (result.status === "rejected") return { error: firstErrorLine(result.reason) };
-      return typeof result.value === "string" && result.value.startsWith("0x") ? { hash: result.value } : { error: "RPC 返回无效交易哈希" };
-    });
+    const results: BatchBroadcastResult[] = [];
+    for (const [index, raw] of serialized.entries()) {
+      try {
+        const hash = await publicClient.request({ method: "eth_sendRawTransaction", params: [raw] }, { retryCount: 0 });
+        if (typeof hash !== "string" || !hash.startsWith("0x")) throw new Error("RPC 返回无效交易哈希");
+        results.push({ hash });
+      } catch (error) {
+        results.push({ error: firstErrorLine(error) });
+        // 后续连续 nonce 依赖当前交易被节点接受；继续提交只会产生卡住的 future nonce 交易。
+        for (let pendingIndex = index + 1; pendingIndex < serialized.length; pendingIndex += 1) {
+          results.push({ error: `未提交：第 ${index + 1} 笔 nonce 广播失败` });
+        }
+        break;
+      }
+    }
+    return results;
   } catch (error) {
     throw new Error(`批量交易准备或签名失败，尚未开始 raw 广播：${firstErrorLine(error)}`);
   }
