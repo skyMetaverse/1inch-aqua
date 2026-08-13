@@ -35,6 +35,7 @@ export function buildConcentratedStrategy(parameters: {
   rawPriceMax: bigint;
   feeValue: bigint;
   amounts: Array<{ token: ViemAddress; amount: bigint }>;
+  salt?: bigint;
 }): BuiltStrategy {
   if (parameters.rawPriceMin <= 0n || parameters.rawPriceMin >= parameters.rawPriceMax) {
     throw new Error("Aqua rawPrice 区间无效");
@@ -49,8 +50,9 @@ export function buildConcentratedStrategy(parameters: {
   if (!registry || !app) throw new Error(`当前 SDK 不支持 chainId=${parameters.chainId} 的 Aqua 策略地址`);
 
   const feeBps = aquaFeeValueToBps(parameters.feeValue);
-  // Aqua 已 dock 的 strategyHash 不能原地重开；SDK SaltArgs 只接受 uint64，因此使用 64 位加密随机 salt 保证策略 hash 唯一性。
-  const salt = BigInt(`0x${randomBytes(8).toString("hex")}`);
+  // Aqua 已 dock 的 strategyHash 不能原地重开；新建时使用 64 位加密随机 salt，恢复时复用已持久化 salt 保证不会生成第二个策略 hash。
+  const salt = parameters.salt ?? BigInt(`0x${randomBytes(8).toString("hex")}`);
+  if (salt < 0n || salt > (2n ** 64n - 1n)) throw new Error("策略 salt 必须是 uint64");
   const program = AquaXYCAmmStrategy.newConcentrate({
     rawPriceMin: parameters.rawPriceMin,
     rawPriceMax: parameters.rawPriceMax,

@@ -44,3 +44,18 @@ bun run add-lp config/lp.add.jsonc
 ```
 
 真实执行仅在现有 allowance 未覆盖本次投入时尝试 `MAX_UINT256`。确认后脚本重新读取实际 allowance，只要该额度覆盖本次投入就继续；不会假设所有 ERC20 都原样存储 `MAX_UINT256`。所有非零且不足的 allowance 会先发送并确认 `approve(0)`，随后尝试最大授权，以兼容要求清零后才能修改额度的 ERC20。授权成功后 ship 失败时，授权仍会保留；脚本不会自动撤销授权。
+
+## 自动再平衡 Bot
+
+复制 `rebalance.example.jsonc` 为本地 `rebalance.jsonc` 后运行：
+
+```bash
+cp config/rebalance.example.jsonc config/rebalance.jsonc
+bun run rebalance-bot config/rebalance.jsonc
+```
+
+此命令没有 `--dry-run`：输入私钥解密密码后会持续监控，并在满足策略条件时直接广播 `dock`、必要授权和 `ship`。仅支持当前 SDK 的 active concentrated 两 token 策略；未知 app、同一 pair 多条 active 策略、API 分页未确认、市场数据异常或链上预检不一致时会停止该仓位的自动处理并写中文日志。
+
+Bot 使用官方 `strategies/makers` API 发现仓位和决定当前余额形态，使用 Pair API 检查市场活跃度，使用 EMSH current 计算 5 bp 区间。RPC 不按区块轮询仓位，只在已决定重挂的交易前后做 rawBalances、模拟、事件和回执复核。运行状态写入配置指定的 `stateFile`，其中包含待恢复计划但不包含私钥、密码、Bearer token 或完整 RPC URL；该文件与本地 `rebalance.jsonc` 均被 Git 忽略。
+
+若 `dock` 已确认而 `ship` 因 RPC、余额、授权或合约状态变化失败，Bot 保留同一份计划并在下一轮优先恢复，不会生成第二个策略 hash 或悄悄修改投入金额。运行前应阅读 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。

@@ -108,7 +108,7 @@ function validateAmountsForMode(position: PositionConfig, amounts: [bigint, bigi
 }
 
 /** 对一个 token 的最大授权进行预览或真实执行，并在每笔后复查状态。 */
-async function ensureMaximumAllowance(parameters: {
+export async function ensureMaximumAllowance(parameters: {
   publicClient: ReturnType<typeof createPublicClient>;
   account: ReturnType<typeof privateKeyToAccount>;
   chain: Chain;

@@ -1,0 +1,28 @@
+{
+  // RPC_URL 必须连接到此链；实际运行配置保存为 config/rebalance.jsonc，不能提交。
+  "chainId": 1,
+  "polling": {
+    "intervalSeconds": 30,
+    "stableSnapshotsRequired": 3,
+    "maxCurrentPriceAgeSeconds": 120
+  },
+  "market": {
+    // Pair lastPrice 与 EMSH current 超过该偏离时停止自动交易；二者语义不同，不能用 5 bp。
+    "maxPairPriceDeviationPercent": "1%",
+    "minimumPairVolumeUsd": "1000",
+    "minimumPairSwaps": 1
+  },
+  "rebalance": {
+    "fee": "0.001%",
+    // 单边总宽度 5 bp；双边上下各 5 bp。
+    "singleSidedWidth": "0.05%",
+    "twoSidedHalfWidth": "0.05%",
+    "recenterExcess": "0.03%",
+    "cooldownSeconds": 900,
+    // 单边部分成交后，小侧 USD 达到大侧的 80% 即转双边。
+    "convertToTwoSidedMinValueRatioBps": 8000
+  },
+  "runtime": {
+    "stateFile": "state/rebalance-state.json"
+  }
+}

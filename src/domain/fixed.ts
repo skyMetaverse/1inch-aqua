@@ -150,6 +150,23 @@ export function convertDisplayRangeToAquaRange(
 }
 
 /**
+ * 将 Aqua 规范 tokenGt/tokenLt 的 raw 区间转换回 API token 顺序的展示区间。
+ * 旧策略解码得到的是规范地址方向；该转换只用于判断 current 是否越界，必须与创建时的反向规则完全对称。
+ */
+export function convertAquaRangeToDisplayRange(
+  displayToken0: string,
+  displayToken1: string,
+  aquaRange: { rawPriceMin: bigint; rawPriceMax: bigint },
+): Pick<DisplayPriceRange, "min" | "max"> {
+  if (aquaRange.rawPriceMin <= 0n || aquaRange.rawPriceMin >= aquaRange.rawPriceMax) throw new Error("Aqua raw 价格区间无效");
+  if (displayToken0.toLowerCase() < displayToken1.toLowerCase()) return { min: aquaRange.rawPriceMin, max: aquaRange.rawPriceMax };
+  const min = (FIXED_SCALE * FIXED_SCALE) / aquaRange.rawPriceMax;
+  const max = (FIXED_SCALE * FIXED_SCALE) / aquaRange.rawPriceMin;
+  if (min <= 0n || min >= max) throw new Error("反向展示价格区间无效");
+  return { min, max };
+}
+
+/**
  * 将页面显示费率转换为 SDK FlatFee 的内部整数值。
  * SDK 编码为 feePercent * 10^7，例如 0.001% 必须精确得到 10000。
  */

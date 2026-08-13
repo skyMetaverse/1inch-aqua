@@ -7,6 +7,7 @@ import { expect, test } from "bun:test";
 import {
   calculateDisplayRange,
   calculatePercentAmount,
+  convertAquaRangeToDisplayRange,
   convertDisplayRangeToAquaRange,
   FIXED_SCALE,
   invertFixedPrice,
@@ -33,14 +34,19 @@ test("双边区间允许上下不对称", () => {
 
 test("反向地址排序会精确翻转 Aqua raw 价格区间", () => {
   const range = calculateDisplayRange(FIXED_SCALE * 3000n, "two-sided", parsePercentage("10%", "upper"), parsePercentage("10%", "lower"));
-  const aquaRange = convertDisplayRangeToAquaRange(
-    "0xdac17f958d2ee523a2206206994597c13d831ec7",
-    "0x111111111117dc0aa78b770fa6a738034120c302",
-    range,
-  );
+  const token0 = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+  const token1 = "0x111111111117dc0aa78b770fa6a738034120c302";
+  const aquaRange = convertDisplayRangeToAquaRange(token0, token1, range);
   expect(aquaRange.isDisplayOrderCanonical).toBe(false);
   expect(aquaRange.rawPriceMin).toBe((FIXED_SCALE * FIXED_SCALE) / range.max);
   expect(aquaRange.rawPriceMax).toBe((FIXED_SCALE * FIXED_SCALE) / range.min);
+  const displayRange = convertAquaRangeToDisplayRange(token0, token1, aquaRange);
+  // 两次整数倒数不可逆，但误差必须远小于策略区间，且恢复区间顺序必须正确。
+  const minError = displayRange.min > range.min ? displayRange.min - range.min : range.min - displayRange.min;
+  const maxError = displayRange.max > range.max ? displayRange.max - range.max : range.max - displayRange.max;
+  expect(minError).toBeLessThan(10n ** 7n);
+  expect(maxError).toBeLessThan(10n ** 7n);
+  expect(displayRange.min).toBeLessThan(displayRange.max);
 });
 
 test("下浮 100% 被拒绝，防止生成零价格", () => {

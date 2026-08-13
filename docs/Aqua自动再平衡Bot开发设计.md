@@ -209,7 +209,7 @@ config/rebalance.jsonc
 
   "market": {
     // 当前范围以 EMSH current 为准；Pair API 仅作活跃度和偏差保护。
-    "maxPairPriceDeviationPercent": "0.20%",
+    "maxPairPriceDeviationPercent": "1%",
     "minimumPairVolumeUsd": "1000",
     "minimumPairSwaps": 1
   },
@@ -233,7 +233,7 @@ config/rebalance.jsonc
 
 - `fee`：新建仓位的固定 Aqua taker fee；不信任 API `feePercent: number` 直接作为交易参数。
 - `minimumPairVolumeUsd` 和 `minimumPairSwaps`：Pair API 低于任一阈值时不自动重挂，只记录原因。USD JSON number 仅用于与配置阈值的运营判断，不参与 token raw amount 或价格区间计算。
-- `maxPairPriceDeviationPercent`：EMSH current 与 Pair `lastPrice` 偏离超过阈值时停止自动交易，记录两源价格冲突，防止在 5 bp 窄区间上使用异常或滞后数据。
+- `maxPairPriceDeviationPercent`：EMSH current 与 Pair `lastPrice` 偏离超过阈值时停止自动交易，记录两源价格冲突。实测 `1INCH/UNI` 的两者可正常相差约 `0.30%`，因为接口语义不同；默认使用 `1%` 作为异常熔断，而不是误用 5 bp 要求两者一致。
 - `convertToTwoSidedMinValueRatioBps=8000`：小侧 USD 至少为大侧 USD 的 80% 时视为接近等值。
 - `stateFile`：持久化状态，仅用于幂等恢复与计划生命周期，绝不替代 API 形成业务决策。
 
@@ -326,7 +326,6 @@ DISCOVERED
        -> DOCK_PRECHECKED
        -> DOCK_SENT
        -> DOCK_VERIFIED
-       -> SHIP_PRECHECKED
        -> SHIP_SENT
        -> SHIP_VERIFIED
        -> ACTIVE_LATEST
@@ -370,18 +369,19 @@ shipTransactionHash?
 恢复规则：
 
 ```text
-若 stateFile 存在 DOCK_VERIFIED / SHIP_PRECHECKED / SHIP_SENT 未完成计划：
+若 stateFile 存在 PLAN_PERSISTED / DOCK_SENT / DOCK_VERIFIED / SHIP_SENT 未完成计划：
   下一轮优先恢复该计划。
   不为同一 logicalPositionKey 生成新计划。
   若 ship 尚未发送，重新进行必要余额、授权和 ship 模拟后继续。
   若 ship 已发送，先查询该 hash receipt，确认成功后完成复核；失败才进入阻止状态。
+  若进程在 RPC 接收交易后、交易 hash 尚未来得及写入 stateFile 时中断，计划阶段会缺少 hash。此时 Bot 必须阻止该逻辑仓位，不能猜测重发；调用方需先在链上确认原交易是否已落链，再处理该状态文件。
 ```
 
 若恢复时钱包余额已不足以支付计划的 API 原始数量，停止自动交易并保留状态文件与中文日志。不得悄悄降低投入数量或改变单/双边模式。
 
 ### 7.3 API 更新延迟
 
-交易后策略 API 可能短暂滞后。新 `ship` 经 receipt、事件和 rawBalances 链上复核成功后，状态机可标记为 `ACTIVE_LATEST`；下一轮等待 API 发现新策略。若超过固定观察窗口仍未出现新 hash，记录索引延迟，但不再次 ship。
+交易后策略 API 可能短暂滞后。新 `ship` 经 receipt、事件和 rawBalances 链上复核成功后，状态机可标记为 `ACTIVE_LATEST`；在 API 返回已持久化的新 strategy hash 前，Bot 只记录并等待索引同步，不会对仍返回的旧 hash 再次生成计划或再次 ship。
 
 ## 8. 交易安全流程
 

@@ -99,6 +99,24 @@ bun run cancel-all-active-lp
 bun run cancel-all-active-lp --help
 ```
 
+## 自动再平衡 Bot
+
+Bot 监控 1inch 官方策略 API 返回的当前 maker 全部受支持 active concentrated 仓位，以策略 API 的 `currentBalance` 判断当前资产状态，以 Pair API 判断市场活跃度，以 EMSH current 计算新的 5 bp 区间。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足连续越界、冷却期、市场活跃度和价格交叉校验条件时自动执行 `dock -> ship`。
+
+先创建本地运行配置：
+
+```bash
+cp config/rebalance.example.jsonc config/rebalance.jsonc
+```
+
+再使用交互式终端启动：
+
+```bash
+bun run rebalance-bot config/rebalance.jsonc
+```
+
+Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、同一 pair 有多条活跃策略、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+
 运行回归测试：
 
 ```bash
