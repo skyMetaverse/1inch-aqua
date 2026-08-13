@@ -24,6 +24,14 @@ export interface AquaPriceRange {
   isDisplayOrderCanonical: boolean;
 }
 
+function parseDecimalParts(text: string, fieldName: string): { integerText: string; fractionText: string } {
+  const normalized = text.trim();
+  const match = normalized.match(/^(?:0|[1-9]\d*)(?:\.(\d+))?$/);
+  if (!match) throw new Error(`${fieldName} 必须是非负十进制文本，不能使用指数写法`);
+  const [integerText, fractionText = ""] = normalized.split(".");
+  return { integerText: integerText ?? "0", fractionText };
+}
+
 /**
  * 解析无符号十进制文本到指定精度。
  * 不允许指数写法、负数或超过精度的小数，避免静默截断造成交易参数变化。
@@ -32,18 +40,32 @@ export function parseDecimal(text: string, decimals: number, fieldName: string):
   if (!Number.isSafeInteger(decimals) || decimals < 0) {
     throw new Error(`${fieldName} 的精度参数无效`);
   }
-  const normalized = text.trim();
-  const match = normalized.match(/^(?:0|[1-9]\d*)(?:\.(\d+))?$/);
-  if (!match) {
-    throw new Error(`${fieldName} 必须是非负十进制文本，不能使用指数写法`);
-  }
-
-  const [integerText, fractionText = ""] = normalized.split(".");
+  const { integerText, fractionText } = parseDecimalParts(text, fieldName);
   if (fractionText.length > decimals) {
     throw new Error(`${fieldName} 小数位超过允许的 ${decimals} 位，拒绝截断`);
   }
-  const integer = integerText ?? "0";
-  return BigInt(integer) * 10n ** BigInt(decimals) + BigInt(fractionText.padEnd(decimals, "0") || "0");
+  return BigInt(integerText) * 10n ** BigInt(decimals) + BigInt(fractionText.padEnd(decimals, "0") || "0");
+}
+
+/**
+ * 将正十进制文本向下量化到指定精度。
+ * Aqua raw 价格固定为 1e18；EMSH 可能返回更多小数，因此只在价格源适配边界向下取整，并把是否损失精度返回给调用方审计。
+ */
+export function parseDecimalFloor(text: string, decimals: number, fieldName: string): { value: bigint; truncated: boolean; discardedFraction: string } {
+  if (!Number.isSafeInteger(decimals) || decimals < 0) {
+    throw new Error(`${fieldName} 的精度参数无效`);
+  }
+  const { integerText, fractionText } = parseDecimalParts(text, fieldName);
+  const keptFraction = fractionText.slice(0, decimals).padEnd(decimals, "0");
+  const discardedFraction = fractionText.slice(decimals);
+  const value = BigInt(integerText) * 10n ** BigInt(decimals) + BigInt(keptFraction || "0");
+  // 价格量化后如果变成零，后续区间和倒数都会失去有效性，必须在价格源边界立即停止。
+  if (value <= 0n) throw new Error(`${fieldName} 向下量化到 ${decimals} 位后必须大于零`);
+  return {
+    value,
+    truncated: discardedFraction.length > 0 && /[1-9]/.test(discardedFraction),
+    discardedFraction,
+  };
 }
 
 /** 解析带 % 的文本；返回百分比数值本身的 1e18 定点表示，例如 0.001% -> 10^15。 */

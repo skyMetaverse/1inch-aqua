@@ -21,7 +21,7 @@
 5. 查询两个 ERC20 代币的 `decimals`、钱包余额和 Aqua registry allowance。
 6. 按配置的余额百分比计算投入数量。
 7. 调用 EMSH 的 `current` 接口获取本次创建使用的实时价格。
-8. 使用无损定点整数运算计算价格区间。
+8. 将 EMSH current 在价格源边界向下量化到 Aqua 支持的 18 位定点精度，并记录精度损失；随后使用 bigint 定点整数运算计算价格区间。
 9. 构建 Aqua 集中流动性策略和 `ship` 交易。
 10. 必要时按代币兼容规则发送最大值 ERC20 `approve` 交易并等待确认。
 11. 发送 `ship` 交易并等待确认。
@@ -243,10 +243,11 @@ RPC_URL=https://your-rpc.example
 - 不实现 Chainlink 接口。
 - 不使用 `lastPrice`、缓存价格、旧价格或配置中的静态价格回退。
 - current 请求失败、返回为空、价格非法或时间信息不可信时，直接停止本仓位广播。
+- EMSH current 超过 18 位小数时允许在价格源边界向下量化到 18 位；量化后的价格必须大于零，并记录原始价格、使用价格和被舍弃小数。
 - 当前实现最大接受数据年龄为 120 秒，最多允许 60 秒未来时间偏差；超出范围直接停止。
 - 已通过真实请求确认路径为 `GET /v2.0/charts/v1.0/chart/tradingview/{token0}/{token1}/86400/{chainId}/current`，响应为 `{"data":{"result":{"timestamp":...,"price":...}}}`。
 - 已通过同一非锚定交易对的正反 token 顺序请求确认：传入 `[token0, token1]` 时，`price` 表示 `1 token0 = N token1`；交换参数后返回倒数价格。
-- 服务端当前将 `price` 序列化为 JSON number。实现读取原始响应文本并提取该数字字面量，不经过 JSON 解析后的 JavaScript `number`；若接口改为科学计数法、空值、零值、负值或时间戳不可信，必须停止广播。
+- 服务端当前将 `price` 序列化为 JSON number。实现读取原始响应文本并提取该数字字面量，不经过 JSON 解析后的 JavaScript `number`；若接口改为科学计数法、空值、零值、负值或时间戳不可信，必须停止广播。超过 18 位的小数只允许在该价格源边界向下量化，不允许使用 JavaScript 浮点数。
 
 ### 6.2 用户价格方向与 Aqua 方向
 
@@ -277,7 +278,7 @@ Aqua SwapVM SDK 的集中流动性价格使用规范 token 排序下的 `P = tok
 
 核心交易参数禁止使用 JavaScript `Number`：
 
-- current 价格作为十进制文本处理。
+- current 价格作为十进制文本处理；超过 18 位时使用 bigint 向下量化，并记录舍弃的小数。
 - 余额百分比、费率和区间百分比作为十进制文本处理。
 - 使用 `bigint` 定点整数或精确有理数计算。
 - `decimals` 只作为链上返回的整数精度使用。

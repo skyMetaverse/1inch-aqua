@@ -14,7 +14,7 @@ import { buildConcentratedStrategy } from "../aqua/strategy.ts";
 import { parseConcentratedRawRange } from "../aqua/strategy-parser.ts";
 import { validateRebalanceConfig, type RebalanceConfig } from "../config/rebalance-config.ts";
 import { readJsoncFile } from "../config/jsonc.ts";
-import { calculateDisplayRange, convertAquaRangeToDisplayRange, convertDisplayRangeToAquaRange, formatFixed, parseDecimal, parsePercentage, percentageToAquaFeeValue } from "../domain/fixed.ts";
+import { calculateDisplayRange, convertAquaRangeToDisplayRange, convertDisplayRangeToAquaRange, formatFixed, parseDecimal, parseDecimalFloor, parsePercentage, percentageToAquaFeeValue } from "../domain/fixed.ts";
 import { decideRebalance, outsideDistancePercent, relativePriceDeviationPercent, type RebalanceMode } from "../domain/rebalance.ts";
 import { getActiveStrategies, getPairMarkets, type ApiStrategy, type PairMarket } from "../infra/aqua-api.ts";
 import { readTokenState } from "../infra/erc20.ts";
@@ -171,7 +171,7 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
     if (recalculatedHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：strategyBytes hash 校验失败，实际=${recalculatedHash}`); continue; }
     const market = markets[index]; if (!market) throw new Error(`缺少 strategyHash=${strategy.strategyHash} 的 Pair 市场数据`);
     try {
-      const currentResponse = await getCurrentPrice(strategy.tokens[0].address, strategy.tokens[1].address, strategy.chainId); currentTimestampValid(currentResponse.timestamp, parameters.config.polling.maxCurrentPriceAgeSeconds); const current = parseDecimal(currentResponse.priceText, 18, "EMSH current");
+      const currentResponse = await getCurrentPrice(strategy.tokens[0].address, strategy.tokens[1].address, strategy.chainId); currentTimestampValid(currentResponse.timestamp, parameters.config.polling.maxCurrentPriceAgeSeconds); const currentResult = parseDecimalFloor(currentResponse.priceText, 18, "EMSH current"); const current = currentResult.value; if (currentResult.truncated) parameters.logger.info(`EMSH current 精度处理：strategyHash=${strategy.strategyHash}，价格超过 18 位，向下取整；舍弃小数=${currentResult.discardedFraction}`);
       const pairPrice = parseDecimal(String(market.lastPrice), 18, "Pair lastPrice"); const priceDeviation = relativePriceDeviationPercent(current, pairPrice); const maxDeviation = parsePercentage(parameters.config.market.maxPairPriceDeviationPercent, "maxPairPriceDeviationPercent"); const volumeMinimum = Number(parameters.config.market.minimumPairVolumeUsd);
       const marketHealthy = Number.isFinite(volumeMinimum) && market.volumeUsd >= volumeMinimum && market.swaps >= parameters.config.market.minimumPairSwaps && priceDeviation <= maxDeviation;
       const rawRange = parseConcentratedRawRange(strategy.strategyBytes); const display = convertAquaRangeToDisplayRange(strategy.tokens[0].address, strategy.tokens[1].address, rawRange); const oldRange = { ...display, current };

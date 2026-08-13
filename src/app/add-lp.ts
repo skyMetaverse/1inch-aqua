@@ -24,7 +24,7 @@ import {
   FIXED_SCALE,
   formatFixed,
   invertFixedPrice,
-  parseDecimal,
+  parseDecimalFloor,
   parsePercentage,
   percentageToAquaFeeValue,
 } from "../domain/fixed.ts";
@@ -216,8 +216,12 @@ async function addPosition(parameters: {
   logger.info(`开始请求 EMSH current：chainId=${parameters.chainId}，价格方向=1 ${position.pair.tokens[0].symbol} = N ${position.pair.tokens[1].symbol}`);
   const currentResponse = await getCurrentPrice(token0, token1, parameters.chainId);
   verifyCurrentTimestamp(currentResponse.timestamp);
-  const current = parseDecimal(currentResponse.priceText, 18, "EMSH current price");
-  logger.info(`EMSH current 成功：price 原文=${currentResponse.priceText}，timestamp=${currentResponse.timestamp}，本地接收耗时=${currentResponse.elapsedMs}ms，原始响应=${currentResponse.rawResponse}`);
+  const currentResult = parseDecimalFloor(currentResponse.priceText, 18, "EMSH current price");
+  const current = currentResult.value;
+  logger.info(`EMSH current 成功：price 原文=${currentResponse.priceText}，使用价格=${formatFixed(current)}，timestamp=${currentResponse.timestamp}，本地接收耗时=${currentResponse.elapsedMs}ms，原始响应=${currentResponse.rawResponse}`);
+  if (currentResult.truncated) {
+    logger.info(`EMSH current 精度处理：价格超过 18 位，向下取整；舍弃小数=${currentResult.discardedFraction}`);
+  }
 
   const upperPercent = position.range.upperPercent ? parsePercentage(position.range.upperPercent, "upperPercent") : undefined;
   const lowerPercent = position.range.lowerPercent ? parsePercentage(position.range.lowerPercent, "lowerPercent") : undefined;

@@ -101,7 +101,7 @@ Pair API 用于判断交易对近期是否存在自然市场活动，不能作�
 GET https://proxy-app.1inch.com/v2.0/charts/v1.0/chart/tradingview/{token0}/{token1}/86400/{chainId}/current
 ```
 
-现有 `src/infra/emsh.ts` 已实现：从原始 JSON 文本抽取 `price` 数字字面量，拒绝科学计数法，并返回接口时间戳。它是第一版计算新策略 5 bp 区间的唯一价格输入。
+现有 `src/infra/emsh.ts` 已实现：从原始 JSON 文本抽取 `price` 数字字面量，拒绝科学计数法，并返回接口时间戳。价格超过 Aqua 的 18 位定点精度时，由价格源边界使用 bigint 向下量化并记录精度损失；它是第一版计算新策略 5 bp 区间的唯一价格输入。
 
 EMSH current 仅用于市场价格与区间计算；不读取钱包仓位、不决定单边转双边。
 
@@ -306,7 +306,7 @@ current 两侧均为 0：阻止自动处理
 
 一次自动重挂同时必须满足：
 
-1. EMSH current 时间戳在配置最大年龄内，价格为正且可解析为 1e18 bigint。
+1. EMSH current 时间戳在配置最大年龄内，价格为正且可解析为 1e18 bigint；超过 18 位时必须先向下量化且量化结果仍大于零。
 2. Pair API 的 `lastPrice` 正、有限，且与 EMSH current 的偏离不超过配置阈值。
 3. Pair API 的 `volumeUsd >= minimumPairVolumeUsd` 且 `swaps >= minimumPairSwaps`。
 4. 当前策略 API 快照结构完整且支持。

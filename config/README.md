@@ -27,11 +27,11 @@ bun run add-lp config/lp.add.jsonc --dry-run
 - `lower`：区间在 current 下方，`tokens[0]` 必须为 `0%`，只允许 `tokens[1]` 使用非零 `balancePercent`。
 - `two-sided`：两个 token 都必须计算出大于零的投入 raw amount。
 
-脚本以 EMSH `current` 接口作为唯一价格来源。请求失败、时间戳过期、零/负价格、科学计数法价格或价格区间无效时，会在授权和 `ship` 广播前停止。
+脚本以 EMSH `current` 接口作为唯一价格来源。请求失败、时间戳过期、零/负价格、科学计数法价格或价格区间无效时，会在授权和 `ship` 广播前停止。EMSH 返回超过 18 位小数时，脚本会在价格源边界使用 `bigint` 向下量化到 Aqua 的 18 位精度，并在日志记录被舍弃的小数；配置中的百分比、费率和其他价格字段仍拒绝超精度输入。
 
 ## 运行
 
-`--dry-run` 会完成：配置校验、私钥解密、RPC/ERC20 查询、EMSH current、无损区间计算、策略构建、approve 模拟和 ship 模拟。它不会广播任何链上交易。
+`--dry-run` 会完成：配置校验、私钥解密、RPC/ERC20 查询、EMSH current、定点区间计算、策略构建、approve 模拟和 ship 模拟。它不会广播任何链上交易。
 
 ```bash
 bun run add-lp config/lp.add.jsonc --dry-run

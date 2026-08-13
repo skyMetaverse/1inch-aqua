@@ -49,7 +49,7 @@ try {
 
 添加 LP 使用带中文注释的 JSONC 文件。复制 [lp.add.example.jsonc](/Users/syskey/git/1inch-aqua/config/lp.add.example.jsonc) 为 `config/lp.add.jsonc`，填写 ERC20 地址、余额百分比、页面显示费率和单双边范围；完整字段规则见 [config/README.md](/Users/syskey/git/1inch-aqua/config/README.md)。
 
-添加脚本只使用 EMSH `current` 实时价格，以配置 token 顺序作为显示价格方向。价格、百分比、费率和区间全程使用 `bigint` 定点运算，核心交易计算不使用 JavaScript 浮点数。交易使用本地解密私钥签名，通过 RPC 的 `eth_sendRawTransaction` 广播。
+添加脚本只使用 EMSH `current` 实时价格，以配置 token 顺序作为显示价格方向。价格、百分比、费率和区间全程使用 `bigint` 定点运算，核心交易计算不使用 JavaScript 浮点数。EMSH 超过 Aqua 的 18 位价格精度时会在边界向下量化并记录舍弃小数；配置百分比和费率等输入仍严格拒绝超精度。交易使用本地解密私钥签名，通过 RPC 的 `eth_sendRawTransaction` 广播。
 
 先执行 dry-run。它会读取实际余额、allowance、current 价格，计算区间并模拟 approve/ship，但不广播交易：
 

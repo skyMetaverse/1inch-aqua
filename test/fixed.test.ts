@@ -11,6 +11,7 @@ import {
   convertDisplayRangeToAquaRange,
   FIXED_SCALE,
   invertFixedPrice,
+  parseDecimalFloor,
   parsePercentage,
   percentageToAquaFeeValue,
 } from "../src/domain/fixed.ts";
@@ -24,6 +25,18 @@ test("0.001% 费率精确转换为 Aqua 内部值", () => {
 test("余额百分比向下取整且不超过余额", () => {
   expect(calculatePercentAmount(101n, parsePercentage("12.5%", "balancePercent"))).toBe(12n);
   expect(calculatePercentAmount(101n, parsePercentage("100%", "balancePercent"))).toBe(101n);
+});
+
+test("EMSH 超过 18 位价格向下量化并记录舍弃部分", () => {
+  const result = parseDecimalFloor("0.0000000000000000012345", 18, "EMSH current");
+  expect(result.value).toBe(1n);
+  expect(result.truncated).toBe(true);
+  expect(result.discardedFraction).toBe("2345");
+  expect(parseDecimalFloor("1.2300", 18, "EMSH current").truncated).toBe(false);
+});
+
+test("EMSH 价格向下量化为零时拒绝", () => {
+  expect(() => parseDecimalFloor("0.0000000000000000009", 18, "EMSH current")).toThrow("量化到 18 位后必须大于零");
 });
 
 test("双边区间允许上下不对称", () => {
