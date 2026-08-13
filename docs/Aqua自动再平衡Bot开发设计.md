@@ -390,7 +390,7 @@ shipTransactionHash?
 1. 校验 API strategy hash、strategy bytes、maker、chain、app 和 token 列表。
 2. 链上读取全部 rawBalances，并要求与 API 计划 raw 金额完全一致。
 3. 构建并 `eth_call` 模拟 dock。
-4. 使用 `PrivateKeyAccount` 本地签名，通过 `eth_sendRawTransaction` 广播。
+4. 使用 `PrivateKeyAccount` 本地签名；广播前显式读取 pending nonce、估算 gas 和 EIP-1559 fee，通过 `eth_sendRawTransaction` 广播，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。
 5. 等待至少一个确认。
 6. 校验目标 `Docked` 事件。
 7. 回读全部 rawBalances，确认余额为零且 tokensCount 为 docked 哨兵。
@@ -482,7 +482,7 @@ test/
 7. 每逻辑仓位仅保留最新计划；新快照替换旧计划。
 8. 状态文件原子写入、损坏状态拒绝启动、`DOCK_VERIFIED` 后恢复优先级。
 9. `dock` 成功而 `ship` 失败时不生成第二计划、不改变原计划金额。
-10. 本地签名广播仍只使用 `eth_sendRawTransaction`。
+10. 本地签名广播仍只使用 `eth_sendRawTransaction`，并且不依赖 `eth_fillTransaction`。
 
 ### 11.2 集成与手工验收
 

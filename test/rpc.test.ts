@@ -34,6 +34,10 @@ test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () =>
   const transport = custom({
     async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
       requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0x0";
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x3b9aca00";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" } as unknown as Hex;
       if (args.method === "eth_sendRawTransaction") {
         return "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
       }
@@ -54,9 +58,10 @@ test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () =>
   const rawTransactionRequest = requests.find((request) => request.method === "eth_sendRawTransaction");
 
   expect(transactionHash).toBe("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-  // viem 会为 nonce、gas 和费用执行只读 RPC 请求；这里必须精确保护最终广播方法。
+  // nonce、gas 和费用只读查询允许存在；这里必须精确保护最终广播方法和本地签名边界。
   expect(rawTransactionRequest).toBeDefined();
   expect(requests.some((request) => request.method === "eth_sendTransaction")).toBe(false);
+  expect(requests.some((request) => request.method === "eth_fillTransaction")).toBe(false);
   expect(rawTransactionRequest?.params).toHaveLength(1);
   expect(typeof rawTransactionRequest?.params?.[0]).toBe("string");
   expect((rawTransactionRequest?.params?.[0] as string).startsWith("0x")).toBe(true);
