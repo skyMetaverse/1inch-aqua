@@ -333,16 +333,17 @@ formatFixed(value, scale)
 ### 7.1 授权策略
 
 - spender 固定为当前链 Aqua registry 地址，地址来自 SDK 常量或经校验的配置适配器。
-- 授权目标固定为 ERC20 `uint256` 最大值：`2^256 - 1`，即 `0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff`。
-- 每个代币都先查询 `allowance(wallet, aquaRegistry)`；仅当 allowance 已等于最大值时跳过授权。即使 allowance 已覆盖本次投入数量但不是最大值，仍按本需求更新为最大值。
-- 标准 ERC20 且当前 allowance 为零时，直接发送一笔 `approve(aquaRegistry, MAX_UINT256)`。
+- 默认授权目标为 ERC20 `uint256` 最大值：`2^256 - 1`，即 `0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff`。
+- Ethereum 主网 UNI（`0x1f9840a85d5af5bf1d1762f925bdaddc4201f984`）的 allowlist 使用 `uint96`：实链已确认其 `approve(MAX_UINT256)` 交易成功后实际写入 `2^96 - 1` 并发出相同值的 `Approval` 事件。因此 UNI 的最大可用授权固定为 `2^96 - 1`，不重复发送无法提升额度的 `MAX_UINT256` 授权。
+- 每个代币都先查询 `allowance(wallet, aquaRegistry)`；仅当 allowance 已等于该代币的最大可用额度时跳过授权。即使 allowance 已覆盖本次投入数量但不是最大可用额度，仍按本需求更新为最大可用额度。
+- 标准 ERC20 且当前 allowance 为零时，直接发送一笔 `approve(aquaRegistry, tokenMaximumAllowance)`。
 - Ethereum 主网 USDT（`0xdAC17F958D2ee523a2206206994597C13D831ec7`）属于非标准授权代币：当当前 allowance 非零且不是最大值时，直接设置新的非零 allowance 会 revert。因此必须严格按以下顺序执行：
   1. 发送 `approve(aquaRegistry, 0)`。
   2. 等待该清零交易成功确认。
-  3. 再发送 `approve(aquaRegistry, MAX_UINT256)`。
-  4. 等待最大值授权交易成功确认，并重新查询 allowance，确认其等于最大值。
+  3. 再发送 `approve(aquaRegistry, tokenMaximumAllowance)`。
+  4. 等待目标授权交易成功确认，并重新查询 allowance，确认其等于该代币最大可用额度。
 - 对 USDT 当前 allowance 为零的情形，只需发送最大值授权，无需额外清零交易。
-- 第一阶段将此兼容规则显式限定为已确认的 Ethereum 主网 USDT 地址。其他链的 USDT、其他代币或代理升级后的行为，必须在实现时通过真实合约代码或模拟调用确认后才可加入相应规则；不能根据 symbol 猜测。
+- 第一阶段将此兼容规则显式限定为已确认的 Ethereum 主网 USDT 和 UNI 地址。其他链的 USDT、其他代币或代理升级后的行为，必须在实现时通过真实合约代码、事件或模拟调用确认后才可加入相应规则；不能根据 symbol 猜测。
 - 任一 approve 或 allowance 复查失败、回滚、超时，均不得发送 ship。
 - 最大授权会允许 Aqua registry 在用户后续持有该代币时持续使用该代币额度。这是本需求明确选择的授权策略，日志和 README 必须对此风险作出清晰提示，并在后续迭代提供撤销授权脚本。
 
@@ -351,6 +352,7 @@ formatFixed(value, scale)
 - [Tether USDT 已验证源码 `TetherToken.sol`](https://github.com/tethercoin/USDT/blob/main/TetherToken.sol)：`approve` 要求旧 allowance 非零时，新的非零授权必须先清零。
 - [Ethereum 主网 USDT Etherscan 合约源码](https://etherscan.io/address/0xdac17f958d2ee523a2206206994597c13d831ec7#code)：用于核对当前主网地址的已验证合约代码。
 - [OpenZeppelin `SafeERC20.forceApprove`](https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.5.0/contracts/token/ERC20/utils/SafeERC20.sol)：针对 USDT 类代币提供先尝试直接授权，失败后清零再设置目标额度的兼容思路；本项目第一阶段采用更明确、可审计的 allowance 分支流程。
+- Ethereum 主网 UNI 实链交易 `0x2d90d6eaeb1508d7f74bd214164946b4a0df3fced849bc848bdb495331e21e32`：`approve(MAX_UINT256)` 回执成功，但 `Approval` 事件和 `allowance` 回读均为 `79228162514264337593543950335`（`2^96 - 1`），作为本规则的链上依据。
 
 ### 7.2 交易确认
 
@@ -450,7 +452,7 @@ logs/2026-07-24 18-30-55.545.log
 - 投入 raw amount 大于零且不超过余额。
 - `priceMin < priceMax` 且价格均大于零。
 - strategy 构建成功。
-- allowance 最大值状态、USDT 清零后再授权流程和每笔 approve 回执确认。
+- allowance 最大可用额度状态、UNI `uint96` 上限、USDT 清零后再授权流程和每笔 approve 回执确认。
 
 所有失败都必须在发送下一笔交易前停止。多 position 执行策略应在实现前明确：第一阶段默认任一 position 失败即停止后续 position，避免部分成功后继续消耗资产；后续如需“失败后继续”再增加显式配置。
 
@@ -475,6 +477,7 @@ logs/2026-07-24 18-30-55.545.log
 
 - 使用 mock RPC 验证 `decimals`、`balanceOf`、`allowance` 调用。
 - 验证标准 ERC20 的零 allowance 直接最大值授权、已最大值授权跳过，以及非最大值授权更新路径。
+- 验证 Ethereum 主网 UNI 的 `uint96` 最大可用授权与 `MAX_UINT256` 输入截断后的回读处理。
 - 验证 Ethereum 主网 USDT 的零 allowance 直接最大值授权、非零 allowance 先清零确认再最大值授权，以及任一步失败时不发送 ship。
 - 模拟 approve 成功、失败、回滚和超时。
 - 模拟 ship 成功、失败、回滚和超时。
@@ -490,7 +493,7 @@ logs/2026-07-24 18-30-55.545.log
 1. 只读 RPC 查询验证。
 2. 小额测试钱包验证。
 3. 交易预览日志人工复核。
-4. 标准 ERC20 最大授权、Ethereum 主网 USDT 清零后最大授权以及 ship 的回执验证。
+4. 标准 ERC20 最大授权、Ethereum 主网 UNI `uint96` 最大可用授权、Ethereum 主网 USDT 清零后最大授权以及 ship 的回执验证。
 5. 链上策略页面费率与配置值核对。
 6. 日志中的 current 价格、计算区间和链上结果复盘。
 
@@ -627,7 +630,7 @@ dock 旧策略 -> 等待确认 -> 构建新的 strategy bytes/hash -> 必要时�
 
 1. EMSH 服务端 JSON number 在服务端序列化前是否已经损失超过其数字字面量的精度；当前客户端已避免二次 JavaScript 浮点损失，但无法恢复服务端此前的精度截断。
 2. 所有目标链的 Aqua registry 和 SwapVM router 地址。
-3. 非 Ethereum 主网 USDT 或其他非标准 ERC20 的最大授权兼容规则及其合约行为。
+3. 非 Ethereum 主网 USDT/UNI 或其他非标准 ERC20 的最大授权兼容规则及其合约行为。
 4. RPC 是否支持交易回执等待、链 ID 查询、必要的 eth_call 和 `eth_sendRawTransaction`。
 
 未确认前不应把示例返回值当作稳定接口契约，也不应广播真实资产交易。

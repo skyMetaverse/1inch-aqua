@@ -1,12 +1,14 @@
 /**
  * ERC20 读取与最大授权适配器。
- * 核心功能：读取 decimals、余额和 allowance，构建最大授权交易，并处理 Ethereum 主网 USDT 的先清零再授权约束。
- * 主要流程：链上读取 token 状态 -> 判断最大授权状态 -> 生成一笔或两笔 approve 交易 -> 每笔确认后复查。
+ * 核心功能：读取 decimals、余额和 allowance，按真实代币上限构建最大授权交易，并处理 Ethereum 主网 USDT 的先清零再授权约束。
+ * 主要流程：链上读取 token 状态 -> 确定代币可表达的最大额度 -> 生成一笔或两笔 approve 交易 -> 每笔确认后复查。
  */
 import { encodeFunctionData, type Address, type Hex } from "viem";
 
 export const MAX_UINT256 = (1n << 256n) - 1n;
+export const MAX_UINT96 = (1n << 96n) - 1n;
 export const ETHEREUM_USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7" as Address;
+export const ETHEREUM_UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" as Address;
 
 export const ERC20_ABI = [
   { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] },
@@ -38,6 +40,15 @@ export async function readTokenState(
   return { decimals, balance: BigInt(balanceResult as bigint), allowance: BigInt(allowanceResult as bigint) };
 }
 
+/**
+ * 返回已确认的 token 特定最大可用授权额度。
+ * Ethereum 主网 UNI 的 allowlist 在合约中使用 uint96；实链 approve(uint256 max) 会成功但截断为 2^96 - 1。
+ */
+export function getMaximumAllowance(chainId: number, token: Address): bigint {
+  if (chainId === 1 && token.toLowerCase() === ETHEREUM_UNI.toLowerCase()) return MAX_UINT96;
+  return MAX_UINT256;
+}
+
 /** 构建标准 ERC20 approve calldata。 */
 export function buildApproveData(spender: Address, amount: bigint): Hex {
   return encodeFunctionData({ abi: ERC20_ABI, functionName: "approve", args: [spender, amount] });
@@ -48,13 +59,15 @@ export function buildApproveData(spender: Address, amount: bigint): Hex {
  * 仅对已确认的 Ethereum 主网 USDT 地址，在旧 allowance 非零时强制先清零；不能根据 symbol 推断此兼容性。
  */
 export function buildMaximumApprovalSteps(chainId: number, token: Address, currentAllowance: bigint, spender: Address): Array<{ amount: bigint; data: Hex; reason: string }> {
-  if (currentAllowance === MAX_UINT256) return [];
+  const maximumAllowance = getMaximumAllowance(chainId, token);
+  if (currentAllowance === maximumAllowance) return [];
   const isEthereumUsdt = chainId === 1 && token.toLowerCase() === ETHEREUM_USDT.toLowerCase();
   if (isEthereumUsdt && currentAllowance !== 0n) {
     return [
       { amount: 0n, data: buildApproveData(spender, 0n), reason: "USDT 当前授权非零，先清零以兼容合约限制" },
-      { amount: MAX_UINT256, data: buildApproveData(spender, MAX_UINT256), reason: "设置 USDT 最大授权" },
+      { amount: maximumAllowance, data: buildApproveData(spender, maximumAllowance), reason: "设置 USDT 最大授权" },
     ];
   }
-  return [{ amount: MAX_UINT256, data: buildApproveData(spender, MAX_UINT256), reason: "设置 ERC20 最大授权" }];
+  const reason = maximumAllowance === MAX_UINT96 ? "设置 UNI uint96 最大授权" : "设置 ERC20 最大授权";
+  return [{ amount: maximumAllowance, data: buildApproveData(spender, maximumAllowance), reason }];
 }

@@ -28,7 +28,7 @@ import {
   percentageToAquaFeeValue,
 } from "../domain/fixed.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
-import { buildMaximumApprovalSteps, MAX_UINT256, readTokenState } from "../infra/erc20.ts";
+import { buildMaximumApprovalSteps, getMaximumAllowance, readTokenState } from "../infra/erc20.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { sendLocallySignedTransaction } from "../infra/rpc.ts";
 
@@ -119,18 +119,19 @@ async function ensureMaximumAllowance(parameters: {
   dryRun: boolean;
   logger: Logger;
 }): Promise<void> {
+  const maximumAllowance = getMaximumAllowance(parameters.chainId, parameters.token);
   const steps = buildMaximumApprovalSteps(parameters.chainId, parameters.token, parameters.initialAllowance, parameters.registry);
   if (steps.length === 0) {
-    parameters.logger.info(`token=${parameters.token} 已是最大授权，无需 approve`);
+    parameters.logger.info(`token=${parameters.token} 已是该代币最大可用授权，无需 approve：额度=${maximumAllowance.toString()}`);
     return;
   }
 
   for (const [index, step] of steps.entries()) {
     parameters.logger.info(`token=${parameters.token} 授权步骤 ${index + 1}/${steps.length}：${step.reason}，目标额度=${step.amount.toString()}`);
     if (parameters.dryRun) {
-      // eth_call 不会保留前一步 approve(0) 的状态变化；USDT 清零后的 MAX 授权不能在同一旧状态上模拟。
-      if (step.amount === MAX_UINT256 && index > 0) {
-        parameters.logger.info(`dry-run：token=${parameters.token} 最大授权依赖前一步清零确认，已跳过旧 allowance 状态下的无效 eth_call 模拟`);
+      // eth_call 不会保留前一步 approve(0) 的状态变化；USDT 清零后的目标授权不能在同一旧状态上模拟。
+      if (step.amount === maximumAllowance && index > 0) {
+        parameters.logger.info(`dry-run：token=${parameters.token} 目标授权依赖前一步清零确认，已跳过旧 allowance 状态下的无效 eth_call 模拟`);
       } else {
         await parameters.publicClient.call({ account: parameters.account.address, to: parameters.token, data: step.data, value: 0n });
         parameters.logger.info(`dry-run：token=${parameters.token} approve 模拟成功`);
@@ -155,8 +156,10 @@ async function ensureMaximumAllowance(parameters: {
       functionName: "allowance",
       args: [parameters.account.address, parameters.registry],
     });
-    if (allowance !== MAX_UINT256) throw new Error(`token=${parameters.token} 最大授权复查失败`);
-    parameters.logger.info(`token=${parameters.token} 最大授权复查成功`);
+    if (allowance !== maximumAllowance) {
+      throw new Error(`token=${parameters.token} 最大授权复查失败：期望=${maximumAllowance.toString()}，实际=${allowance.toString()}`);
+    }
+    parameters.logger.info(`token=${parameters.token} 最大授权复查成功：额度=${maximumAllowance.toString()}`);
   }
 }
 
