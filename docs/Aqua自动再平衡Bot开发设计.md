@@ -155,10 +155,10 @@ API 分页无法确认完整
 逻辑仓位 key 固定为：
 
 ```text
-{chainId}:{maker}:{app}:{sortedTokenAddress0}:{sortedTokenAddress1}
+{chainId}:{maker}:{app}:{sortedTokenAddress0}:{sortedTokenAddress1}:{strategyHash}
 ```
 
-不能只使用 `strategyHash`，因为每次重挂都会生成新 hash。相同 pair 同时存在多个策略时，第一版禁止自动处理该逻辑 key 并记录冲突，避免 Bot 不可判定地合并不同策略。
+每个 active `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
 
 ## 4. 默认策略参数
 
@@ -513,6 +513,6 @@ git diff --check
 2. Pair API 是否接受批量 pair，返回顺序是否与请求一一对应，及地址顺序是否强制规范排序。
 3. `lastPrice` 的时间语义，以及 Pair/EMSH 合理偏离阈值在高波动时是否需要调整。
 4. strategies API 新 ship 后的索引延迟分布。
-5. 对同一 pair 存在多个 active concentrated 策略时，API 是否有可用的独立标识以支持安全区分。
+5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 active concentrated 策略必须分别监控，不得按 pair 合并或跳过。
 
 真实返回与本文档冲突时，以真实行为为准，修正实现、测试、示例和本文档后再继续自动交易。

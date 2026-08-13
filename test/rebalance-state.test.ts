@@ -15,11 +15,19 @@ const plan: PersistedPlan = { logicalPositionKey: "1:maker:app:a:b", sourceStrat
 function cleanup(): void { if (existsSync(directory)) rmSync(directory, { recursive: true, force: true }); }
 
 test("原子保存的计划可恢复且锁阻止第二进程", () => {
-  cleanup(); saveRebalanceState(path, { version: 1, plans: { [plan.logicalPositionKey]: plan }, observations: {} });
-  expect(loadRebalanceState(path).plans[plan.logicalPositionKey]).toEqual(plan);
-  const release = acquireRebalanceLock(path);
-  expect(() => acquireRebalanceLock(path)).toThrow("正在运行");
-  release(); cleanup();
+  cleanup();
+  try {
+    saveRebalanceState(path, { version: 1, plans: { [plan.logicalPositionKey]: plan }, observations: {} });
+    expect(loadRebalanceState(path).plans[plan.logicalPositionKey]).toEqual(plan);
+    const release = acquireRebalanceLock(path);
+    try {
+      expect(() => acquireRebalanceLock(path)).toThrow("正在运行");
+    } finally {
+      release();
+    }
+  } finally {
+    cleanup();
+  }
 });
 
 test("损坏状态文件在执行前被拒绝", () => {

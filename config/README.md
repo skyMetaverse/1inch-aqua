@@ -56,7 +56,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-此命令没有 `--dry-run`：输入私钥解密密码后会持续监控，并在满足策略条件时直接广播 `dock`、必要授权和 `ship`。仅支持当前 SDK 的 active concentrated 两 token 策略；未知 app、同一 pair 多条 active 策略、API 分页未确认、市场数据异常或链上预检不一致时会停止该仓位的自动处理并写中文日志。
+此命令没有 `--dry-run`：输入私钥解密密码后会持续监控，并在满足策略条件时直接广播 `dock`、必要授权和 `ship`。仅支持当前 SDK 的 active concentrated 两 token 策略；未知 app、API 分页未确认、市场数据异常或链上预检不一致时会停止该仓位的自动处理并写中文日志。同一 pair 的多个 active strategyHash 会作为独立仓位分别监控，不会互相跳过。
 
 Bot 使用官方 `strategies/makers` API 发现仓位和决定当前余额形态，使用 Pair API 检查市场活跃度，使用 EMSH current 计算 5 bp 区间。RPC 不按区块轮询仓位，只在已决定重挂的交易前后做 rawBalances、模拟、事件和回执复核。运行状态写入配置指定的 `stateFile`，其中包含待恢复计划但不包含私钥、密码、Bearer token 或完整 RPC URL；该文件与本地 `rebalance.jsonc` 均被 Git 忽略。
 

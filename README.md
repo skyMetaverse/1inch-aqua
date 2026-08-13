@@ -117,7 +117,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、同一 pair 有多条活跃策略、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 active strategyHash 会分别监控、分别决策、分别保存状态。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
 
 运行回归测试：
 
