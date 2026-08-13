@@ -28,7 +28,7 @@ import {
   percentageToAquaFeeValue,
 } from "../domain/fixed.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
-import { buildMaximumApprovalSteps, getMaximumAllowance, readTokenState } from "../infra/erc20.ts";
+import { buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { sendLocallySignedTransaction } from "../infra/rpc.ts";
 
@@ -112,26 +112,29 @@ async function ensureMaximumAllowance(parameters: {
   account: ReturnType<typeof privateKeyToAccount>;
   chain: Chain;
   rpcUrl: string;
-  chainId: number;
   token: Address;
   registry: Address;
   initialAllowance: bigint;
+  requiredAmount: bigint;
   dryRun: boolean;
   logger: Logger;
 }): Promise<void> {
-  const maximumAllowance = getMaximumAllowance(parameters.chainId, parameters.token);
-  const steps = buildMaximumApprovalSteps(parameters.chainId, parameters.token, parameters.initialAllowance, parameters.registry);
+  const steps = buildMaximumApprovalSteps(
+    parameters.initialAllowance,
+    parameters.requiredAmount,
+    parameters.registry,
+  );
   if (steps.length === 0) {
-    parameters.logger.info(`token=${parameters.token} 已是该代币最大可用授权，无需 approve：额度=${maximumAllowance.toString()}`);
+    parameters.logger.info(`token=${parameters.token} 当前授权已覆盖本次投入，无需 approve：allowance=${parameters.initialAllowance.toString()}，所需=${parameters.requiredAmount.toString()}`);
     return;
   }
 
   for (const [index, step] of steps.entries()) {
     parameters.logger.info(`token=${parameters.token} 授权步骤 ${index + 1}/${steps.length}：${step.reason}，目标额度=${step.amount.toString()}`);
     if (parameters.dryRun) {
-      // eth_call 不会保留前一步 approve(0) 的状态变化；USDT 清零后的目标授权不能在同一旧状态上模拟。
-      if (step.amount === maximumAllowance && index > 0) {
-        parameters.logger.info(`dry-run：token=${parameters.token} 目标授权依赖前一步清零确认，已跳过旧 allowance 状态下的无效 eth_call 模拟`);
+      // eth_call 不会保留前一步 approve(0) 的状态变化；清零后的授权不能在同一旧状态上模拟。
+      if (index > 0) {
+        parameters.logger.info(`dry-run：token=${parameters.token} 授权依赖前一步清零确认，已跳过旧 allowance 状态下的无效 eth_call 模拟`);
       } else {
         await parameters.publicClient.call({ account: parameters.account.address, to: parameters.token, data: step.data, value: 0n });
         parameters.logger.info(`dry-run：token=${parameters.token} approve 模拟成功`);
@@ -156,10 +159,10 @@ async function ensureMaximumAllowance(parameters: {
       functionName: "allowance",
       args: [parameters.account.address, parameters.registry],
     });
-    if (allowance !== maximumAllowance) {
-      throw new Error(`token=${parameters.token} 最大授权复查失败：期望=${maximumAllowance.toString()}，实际=${allowance.toString()}`);
+    if (!hasSufficientAllowance(allowance, parameters.requiredAmount)) {
+      throw new Error(`token=${parameters.token} 授权复查失败：实际=${allowance.toString()}，本次所需=${parameters.requiredAmount.toString()}`);
     }
-    parameters.logger.info(`token=${parameters.token} 最大授权复查成功：额度=${maximumAllowance.toString()}`);
+    parameters.logger.info(`token=${parameters.token} 授权复查成功：实际=${allowance.toString()}，本次所需=${parameters.requiredAmount.toString()}`);
   }
 }
 
@@ -198,10 +201,9 @@ async function addPosition(parameters: {
   const token1 = requireAddress(position.pair.tokens[1].address, "tokens[1].address");
   logger.info(`开始处理第 ${parameters.index + 1} 个 LP：${position.pair.tokens[0].symbol}(${token0}) / ${position.pair.tokens[1].symbol}(${token1})`);
 
-  const [state0, state1] = await Promise.all([
-    readTokenState(parameters.publicClient, token0, parameters.account.address, parameters.registry),
-    readTokenState(parameters.publicClient, token1, parameters.account.address, parameters.registry),
-  ]);
+  // 低额度 RPC 常限制瞬时 eth_call 数量；两个 token 也按顺序读取，避免六个只读调用同时触发限流。
+  const state0 = await readTokenState(parameters.publicClient, token0, parameters.account.address, parameters.registry);
+  const state1 = await readTokenState(parameters.publicClient, token1, parameters.account.address, parameters.registry);
   const balancePercent0 = parsePercentage(position.pair.tokens[0].balancePercent, "tokens[0].balancePercent");
   const balancePercent1 = parsePercentage(position.pair.tokens[1].balancePercent, "tokens[1].balancePercent");
   const amount0 = calculatePercentAmount(state0.balance, balancePercent0);
@@ -238,8 +240,8 @@ async function addPosition(parameters: {
   logger.info(`策略构建成功：strategyHash=${built.strategyHash}，salt=${built.salt.toString()}，app=${built.app}，ship to=${built.ship.to}，ship data 字节数=${(built.ship.data.length - 2) / 2}`);
 
   // 仅对实际作为策略资金的一侧做授权；单边另一侧 amount=0 不会在策略中被 pull。
-  if (amount0 > 0n) await ensureMaximumAllowance({ ...parameters, token: token0, initialAllowance: state0.allowance });
-  if (amount1 > 0n) await ensureMaximumAllowance({ ...parameters, token: token1, initialAllowance: state1.allowance });
+  if (amount0 > 0n) await ensureMaximumAllowance({ ...parameters, token: token0, initialAllowance: state0.allowance, requiredAmount: amount0 });
+  if (amount1 > 0n) await ensureMaximumAllowance({ ...parameters, token: token1, initialAllowance: state1.allowance, requiredAmount: amount1 });
 
   await parameters.publicClient.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value });
   logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);

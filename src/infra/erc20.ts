@@ -1,14 +1,13 @@
 /**
  * ERC20 读取与最大授权适配器。
- * 核心功能：读取 decimals、余额和 allowance，按真实代币上限构建最大授权交易，并处理 Ethereum 主网 USDT 的先清零再授权约束。
- * 主要流程：链上读取 token 状态 -> 确定代币可表达的最大额度 -> 生成一笔或两笔 approve 交易 -> 每笔确认后复查。
+ * 核心功能：读取 decimals、余额和 allowance，尝试最大授权并按本次投入额验证实际有效额度。
+ * 主要流程：串行读取 token 状态并有限重试临时 RPC 错误 -> 判断本次投入是否已被覆盖 -> 非零不足授权先清零 -> 尝试最大授权 -> 回读实际 allowance。
  */
 import { encodeFunctionData, type Address, type Hex } from "viem";
 
 export const MAX_UINT256 = (1n << 256n) - 1n;
-export const MAX_UINT96 = (1n << 96n) - 1n;
-export const ETHEREUM_USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7" as Address;
-export const ETHEREUM_UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" as Address;
+const READ_RETRY_COUNT = 2;
+const READ_RETRY_DELAY_MS = 500;
 
 export const ERC20_ABI = [
   { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] },
@@ -23,30 +22,57 @@ export interface TokenState {
   allowance: bigint;
 }
 
-/** 读取真实链上状态；token 合约非标准或读取失败时必须停止而非猜测精度。 */
+/**
+ * 对单个 RPC 读取进行有限重试。
+ * 公共 RPC 可能短暂限流或网络抖动；重试后仍失败必须中止，不能用旧余额或猜测额度继续广播。
+ */
+async function readWithRetry<T>(read: () => Promise<T>, token: Address, fieldName: string, retryDelayMs: number): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= READ_RETRY_COUNT; attempt += 1) {
+    try {
+      return await read();
+    } catch (error) {
+      lastError = error;
+      if (attempt === READ_RETRY_COUNT) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs * (attempt + 1)));
+    }
+  }
+  const reason = lastError instanceof Error ? lastError.message.split("\n")[0]?.trim() : "未知 RPC 错误";
+  throw new Error(`token=${token} 读取 ${fieldName} 失败，已重试 ${READ_RETRY_COUNT} 次：${reason || "未知 RPC 错误"}`);
+}
+
+/**
+ * 读取真实链上状态；单 token 内部调用串行执行，降低低额度 RPC 被并发 eth_call 限流的概率。
+ * token 合约非标准或重试后仍读取失败时必须停止而非猜测精度。
+ */
 export async function readTokenState(
   publicClient: { readContract(parameters: unknown): Promise<unknown> },
   token: Address,
   owner: Address,
   spender: Address,
+  retryDelayMs = READ_RETRY_DELAY_MS,
 ): Promise<TokenState> {
-  const [decimalsResult, balanceResult, allowanceResult] = await Promise.all([
-    publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "decimals" }),
-    publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [owner] }),
-    publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "allowance", args: [owner, spender] }),
-  ]);
+  const read = (parameters: unknown, fieldName: string) => readWithRetry(
+    () => publicClient.readContract(parameters),
+    token,
+    fieldName,
+    retryDelayMs,
+  );
+  const decimalsResult = await read({ address: token, abi: ERC20_ABI, functionName: "decimals" }, "decimals");
+  const balanceResult = await read({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [owner] }, "balanceOf");
+  const allowanceResult = await read({ address: token, abi: ERC20_ABI, functionName: "allowance", args: [owner, spender] }, "allowance");
   const decimals = Number(decimalsResult);
   if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) throw new Error(`token=${token} 返回无效 decimals`);
   return { decimals, balance: BigInt(balanceResult as bigint), allowance: BigInt(allowanceResult as bigint) };
 }
 
 /**
- * 返回已确认的 token 特定最大可用授权额度。
- * Ethereum 主网 UNI 的 allowlist 在合约中使用 uint96；实链 approve(uint256 max) 会成功但截断为 2^96 - 1。
+ * 判断链上实际 allowance 是否能覆盖本次策略可能 pull 的 raw amount。
+ * ERC20 ABI 的 approve 参数是 uint256，但实现可采用较小内部存储或无限授权哨兵；不能把等于 MAX_UINT256 当作通用成功条件。
  */
-export function getMaximumAllowance(chainId: number, token: Address): bigint {
-  if (chainId === 1 && token.toLowerCase() === ETHEREUM_UNI.toLowerCase()) return MAX_UINT96;
-  return MAX_UINT256;
+export function hasSufficientAllowance(allowance: bigint, requiredAmount: bigint): boolean {
+  if (allowance < 0n || requiredAmount < 0n) throw new Error("allowance 和所需授权额度不能为负数");
+  return allowance >= requiredAmount;
 }
 
 /** 构建标准 ERC20 approve calldata。 */
@@ -55,19 +81,20 @@ export function buildApproveData(spender: Address, amount: bigint): Hex {
 }
 
 /**
- * 计算最大授权所需的交易序列。
- * 仅对已确认的 Ethereum 主网 USDT 地址，在旧 allowance 非零时强制先清零；不能根据 symbol 推断此兼容性。
+ * 计算尝试最大授权所需的交易序列。
+ * ERC20 中存在“旧额度非零时不允许直接修改”的实现；对所有非零不足额度统一先清零，避免维护基于 token 地址的兼容名单。
  */
-export function buildMaximumApprovalSteps(chainId: number, token: Address, currentAllowance: bigint, spender: Address): Array<{ amount: bigint; data: Hex; reason: string }> {
-  const maximumAllowance = getMaximumAllowance(chainId, token);
-  if (currentAllowance === maximumAllowance) return [];
-  const isEthereumUsdt = chainId === 1 && token.toLowerCase() === ETHEREUM_USDT.toLowerCase();
-  if (isEthereumUsdt && currentAllowance !== 0n) {
+export function buildMaximumApprovalSteps(
+  currentAllowance: bigint,
+  requiredAmount: bigint,
+  spender: Address,
+): Array<{ amount: bigint; data: Hex; reason: string }> {
+  if (hasSufficientAllowance(currentAllowance, requiredAmount)) return [];
+  if (currentAllowance !== 0n) {
     return [
-      { amount: 0n, data: buildApproveData(spender, 0n), reason: "USDT 当前授权非零，先清零以兼容合约限制" },
-      { amount: maximumAllowance, data: buildApproveData(spender, maximumAllowance), reason: "设置 USDT 最大授权" },
+      { amount: 0n, data: buildApproveData(spender, 0n), reason: "当前授权不足且非零，先清零以兼容 ERC20 授权限制" },
+      { amount: MAX_UINT256, data: buildApproveData(spender, MAX_UINT256), reason: "尝试设置 ERC20 最大授权" },
     ];
   }
-  const reason = maximumAllowance === MAX_UINT96 ? "设置 UNI uint96 最大授权" : "设置 ERC20 最大授权";
-  return [{ amount: maximumAllowance, data: buildApproveData(spender, maximumAllowance), reason }];
+  return [{ amount: MAX_UINT256, data: buildApproveData(spender, MAX_UINT256), reason: "尝试设置 ERC20 最大授权" }];
 }

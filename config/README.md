@@ -43,4 +43,4 @@ bun run add-lp config/lp.add.jsonc --dry-run
 bun run add-lp config/lp.add.jsonc
 ```
 
-真实执行默认将代币授权至 `MAX_UINT256`。Ethereum 主网 UNI 因其合约 allowance 存储上限，最大可用授权为 `2^96 - 1`；脚本会识别该额度并避免重复授权。Ethereum 主网 USDT 的已有非零授权会先发送并确认 `approve(0)`，随后发送并确认该代币的最大可用授权。授权成功后 ship 失败时，授权仍会保留；脚本不会自动撤销授权。
+真实执行仅在现有 allowance 未覆盖本次投入时尝试 `MAX_UINT256`。确认后脚本重新读取实际 allowance，只要该额度覆盖本次投入就继续；不会假设所有 ERC20 都原样存储 `MAX_UINT256`。所有非零且不足的 allowance 会先发送并确认 `approve(0)`，随后尝试最大授权，以兼容要求清零后才能修改额度的 ERC20。授权成功后 ship 失败时，授权仍会保留；脚本不会自动撤销授权。

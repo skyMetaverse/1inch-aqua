@@ -63,7 +63,7 @@ bun run add-lp config/lp.add.jsonc --dry-run
 bun run add-lp config/lp.add.jsonc
 ```
 
-真实执行会使用代币可表达的最大授权。默认是 `MAX_UINT256`；Ethereum 主网 UNI 的最大可用授权为合约实际支持的 `2^96 - 1`。若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
+真实执行会在本次投入尚未被现有 allowance 覆盖时尝试 `MAX_UINT256` 授权；确认后以链上实际回读的 allowance 是否覆盖本次投入为准。这样可兼容内部存储小于 `uint256` 或采用无限授权哨兵值的 ERC20。若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
 
 ## 一键取消全部活跃 LP 仓位
 
