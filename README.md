@@ -65,6 +65,8 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行会在本次投入尚未被现有 allowance 覆盖时尝试 `MAX_UINT256` 授权；确认后以链上实际回读的 allowance 是否覆盖本次投入为准。这样可兼容内部存储小于 `uint256` 或采用无限授权哨兵值的 ERC20。若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
 
+当配置中的仓位数超过 2 个时，脚本会先完成全部仓位的余额、价格、授权和 `ship` 模拟，再通过 JSON-RPC batch 一次提交多笔本地签名的 `eth_sendRawTransaction`。这会减少 RPC 往返，但链上仍是多笔独立交易，并逐笔等待回执、校验事件和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。批量提交部分成功时会记录已成功 hash，并禁止自动重发整批。
+
 ## 一键取消全部活跃 LP 仓位
 
 脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。

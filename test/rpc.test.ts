@@ -5,9 +5,9 @@
  */
 
 import { expect, test } from "bun:test";
-import { custom, defineChain, type Hex } from "viem";
+import { custom, defineChain, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
+import { sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
 
 /** 测试专用链定义；不连接公共 RPC，也不携带任何真实账户或真实节点信息。 */
 const testChain = defineChain({
@@ -29,6 +29,31 @@ const testAccount = privateKeyToAccount(
  * 捕获钱包 client 的 JSON-RPC 请求。
  * 返回伪造交易哈希即可使 sendTransaction 完成，从而精确检查是否错误调用节点代签接口。
  */
+test("批量本地签名交易使用连续 nonce 并返回每笔 hash", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<unknown> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0x7";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x3b9aca00";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" };
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_sendRawTransaction") return `0x${String(requests.filter((request) => request.method === "eth_sendRawTransaction").length).padStart(64, "0")}`;
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  const results = await sendLocallySignedTransactions(testAccount, testChain, transport, [
+    { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x01", value: 0n },
+    { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x02", value: 0n },
+  ]);
+  const rawRequests = requests.filter((request) => request.method === "eth_sendRawTransaction");
+  expect(results.every((result) => result.hash !== undefined && result.error === undefined)).toBe(true);
+  expect(rawRequests).toHaveLength(2);
+  const nonces = rawRequests.map((request) => parseTransaction(request.params?.[0] as Hex).nonce);
+  expect(nonces).toEqual([7, 8]);
+  expect(requests.some((request) => request.method === "eth_fillTransaction")).toBe(false);
+});
+
 test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () => {
   const requests: Array<{ method: string; params?: unknown[] }> = [];
   const transport = custom({

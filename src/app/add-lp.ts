@@ -29,14 +29,21 @@ import {
   percentageToAquaFeeValue,
 } from "../domain/fixed.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
-import { buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
+import { ERC20_ABI, buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
-import { sendLocallySignedTransaction } from "../infra/rpc.ts";
+import { sendLocallySignedTransaction, sendLocallySignedTransactions } from "../infra/rpc.ts";
 
 const DEFAULT_CONFIG_PATH = "config/lp.add.jsonc";
 const ENV_FILE = ".env";
 const RPC_URL_FIELD = "RPC_URL";
 const MAX_CURRENT_PRICE_AGE_SECONDS = 120;
+
+interface PreparedShip {
+  index: number;
+  built: ReturnType<typeof buildConcentratedStrategy>;
+  tokens: [Address, Address];
+  amounts: [bigint, bigint];
+}
 
 let activeLogger: Logger | null = null;
 
@@ -196,7 +203,8 @@ async function addPosition(parameters: {
   rpcUrl: string;
   dryRun: boolean;
   logger: Logger;
-}): Promise<void> {
+  batchShip: boolean;
+}): Promise<PreparedShip | undefined> {
   const { position, logger } = parameters;
   const token0 = requireAddress(position.pair.tokens[0].address, "tokens[0].address");
   const token1 = requireAddress(position.pair.tokens[1].address, "tokens[1].address");
@@ -262,42 +270,99 @@ async function addPosition(parameters: {
   logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);
   if (parameters.dryRun) {
     logger.info(`dry-run：未广播 ship，strategyHash=${built.strategyHash}`);
-    return;
+    return undefined;
+  }
+  if (parameters.batchShip) {
+    logger.info(`ship 已准备：strategyHash=${built.strategyHash}，等待批量广播`);
+    return { index: parameters.index, built, tokens: [token0, token1], amounts: [amount0, amount1] };
   }
 
   const hash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), built.ship);
+  await verifyShipReceipt({ ...parameters, built, tokens: [token0, token1], amounts: [amount0, amount1], hash });
+  return undefined;
+}
+
+async function verifyShipReceipt(parameters: {
+  publicClient: ReturnType<typeof createPublicClient>;
+  registry: Address;
+  account: ReturnType<typeof privateKeyToAccount>;
+  built: ReturnType<typeof buildConcentratedStrategy>;
+  tokens: [Address, Address];
+  amounts: [bigint, bigint];
+  hash: Hex;
+  logger: Logger;
+  index: number;
+}): Promise<void> {
+  const { publicClient, registry, account, built, tokens, amounts, hash, logger } = parameters;
   logger.info(`ship 已广播：strategyHash=${built.strategyHash}，交易哈希=${hash}`);
-  const receipt = await parameters.publicClient.waitForTransactionReceipt({ hash, confirmations: 1 });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash, confirmations: 1 });
   logger.info(`ship 已确认：strategyHash=${built.strategyHash}，状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
   if (receipt.status !== "success") throw new Error(`ship 回执失败：${hash}`);
   const receiptLogs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>;
-  verifyShippedEvent(receiptLogs, parameters.registry, parameters.account.address, built.app, built.strategyHash);
+  verifyShippedEvent(receiptLogs, registry, account.address, built.app, built.strategyHash);
   logger.info(`Shipped 事件校验成功：strategyHash=${built.strategyHash}`);
-
-  for (const item of [{ token: token0, expected: amount0 }, { token: token1, expected: amount1 }]) {
-    // 单边仓位的零投入 token 不会发生余额增加，因此不能要求其出现在 Pushed 事件中。
-    if (item.expected > 0n) {
+  for (const [index, token] of tokens.entries()) {
+    const expected = amounts[index] ?? 0n;
+    if (expected > 0n) {
       const pushedTopic = PushedEvent.TOPIC.toString().toLowerCase();
       const pushed = receiptLogs.some((log) => {
-        if (log.address.toLowerCase() !== parameters.registry.toLowerCase() || log.topics[0]?.toLowerCase() !== pushedTopic) return false;
+        if (log.address.toLowerCase() !== registry.toLowerCase() || log.topics[0]?.toLowerCase() !== pushedTopic) return false;
         const event = PushedEvent.fromLog({ data: log.data, topics: log.topics as unknown as [Hex, ...Hex[]] });
-        return event.maker.toString().toLowerCase() === parameters.account.address.toLowerCase() && event.app.toString().toLowerCase() === built.app.toLowerCase() && event.strategyHash.toString().toLowerCase() === built.strategyHash.toLowerCase() && event.token.toString().toLowerCase() === item.token.toLowerCase() && event.amount === item.expected;
+        return event.maker.toString().toLowerCase() === account.address.toLowerCase() && event.app.toString().toLowerCase() === built.app.toLowerCase() && event.strategyHash.toString().toLowerCase() === built.strategyHash.toLowerCase() && event.token.toString().toLowerCase() === token.toLowerCase() && event.amount === expected;
       });
-      if (!pushed) throw new Error(`ship 回执中未找到匹配的 Pushed 事件：token=${item.token}`);
-      logger.info(`Pushed 事件校验成功：token=${item.token}，amount=${item.expected.toString()}`);
+      if (!pushed) throw new Error(`ship 回执中未找到匹配的 Pushed 事件：token=${token}`);
+      logger.info(`Pushed 事件校验成功：token=${token}，amount=${expected.toString()}`);
     } else {
-      logger.info(`token=${item.token} 投入为 0，跳过 Pushed 事件校验，继续复核 rawBalances`);
+      logger.info(`token=${token} 投入为 0，跳过 Pushed 事件校验，继续复核 rawBalances`);
     }
-    const [balance, tokensCount] = await parameters.publicClient.readContract({
-      address: parameters.registry,
-      abi: AquaAbi.AQUA_ABI,
-      functionName: "rawBalances",
-      args: [parameters.account.address, built.app, built.strategyHash, item.token],
-    }) as readonly [bigint, number];
-    logger.info(`ship 后链上复核：token=${item.token}，虚拟余额=${balance.toString()}，tokensCount=${tokensCount}`);
-    if (balance !== item.expected || tokensCount !== 2) throw new Error(`ship 后虚拟余额复核失败：token=${item.token}`);
+    const [balance, tokensCount] = await publicClient.readContract({ address: registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [account.address, built.app, built.strategyHash, token] }) as readonly [bigint, number];
+    logger.info(`ship 后链上复核：token=${token}，虚拟余额=${balance.toString()}，tokensCount=${tokensCount}`);
+    if (balance !== expected || tokensCount !== 2) throw new Error(`ship 后虚拟余额复核失败：token=${token}`);
   }
   logger.info(`第 ${parameters.index + 1} 个 LP 添加完成：strategyHash=${built.strategyHash}`);
+}
+
+/**
+ * 批量提交已经完成模拟的 ship。
+ * 发送前重新合计同一 token 的 raw 投入，避免多个仓位各自模拟成功但合计超过钱包余额。
+ * JSON-RPC batch 可能部分成功；成功 hash 必须落日志，失败时禁止自动重发整批。
+ */
+async function broadcastPreparedShips(parameters: {
+  ships: readonly PreparedShip[];
+  publicClient: ReturnType<typeof createPublicClient>;
+  account: ReturnType<typeof privateKeyToAccount>;
+  chain: Chain;
+  rpcUrl: string;
+  registry: Address;
+  logger: Logger;
+}): Promise<void> {
+  const totals = new Map<string, { token: Address; amount: bigint }>();
+  for (const ship of parameters.ships) {
+    for (const [index, token] of ship.tokens.entries()) {
+      const amount = ship.amounts[index] ?? 0n;
+      const key = token.toLowerCase();
+      const existing = totals.get(key);
+      totals.set(key, { token, amount: (existing?.amount ?? 0n) + amount });
+    }
+  }
+  for (const { token, amount } of totals.values()) {
+    const balance = await parameters.publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [parameters.account.address] }) as bigint;
+    if (balance < amount) throw new Error(`批量 ship 前余额不足：token=${token}，最新余额=${balance.toString()}，合计投入=${amount.toString()}`);
+    parameters.logger.info(`批量 ship 余额复核：token=${token}，最新余额=${balance.toString()}，合计投入=${amount.toString()}`);
+  }
+  const results = await sendLocallySignedTransactions(parameters.account, parameters.chain, http(parameters.rpcUrl, { batch: true }), parameters.ships.map((ship) => ship.built.ship));
+  results.forEach((result, index) => {
+    const ship = parameters.ships[index];
+    if (result.hash) parameters.logger.info(`批量 ship 已提交：第 ${(ship?.index ?? index) + 1} 个 LP，strategyHash=${ship?.built.strategyHash ?? "unknown"}，交易哈希=${result.hash}`);
+    if (result.error) parameters.logger.info(`批量 ship 提交失败：第 ${(ship?.index ?? index) + 1} 个 LP，原因=${result.error}`);
+  });
+  const failures = results.flatMap((result, index) => result.error ? [`第 ${(parameters.ships[index]?.index ?? index) + 1} 个 LP 广播失败：${result.error}`] : []);
+  if (failures.length > 0) throw new Error(`批量 ship 部分失败：${failures.join("；")}；已成功 hash 已记录，禁止自动重发`);
+  await Promise.all(parameters.ships.map(async (ship, index) => {
+    const hash = results[index]?.hash;
+    if (!hash) throw new Error(`第 ${ship.index + 1} 个 LP 未返回交易哈希`);
+    await verifyShipReceipt({ publicClient: parameters.publicClient, registry: parameters.registry, account: parameters.account, built: ship.built, tokens: ship.tokens, amounts: ship.amounts, hash, logger: parameters.logger, index: ship.index });
+  }));
 }
 
 async function main(): Promise<void> {
@@ -327,8 +392,15 @@ async function main(): Promise<void> {
     if (!code || code === "0x") throw new Error(`Aqua registry=${registry} 未检测到合约代码`);
     logger.info(`RPC 与 Aqua registry 校验成功：chainId=${rpcChainId}，registry=${registry}`);
 
+    const batchShip = config.positions.length > 2;
+    if (batchShip && !dryRun) logger.info(`仓位数=${config.positions.length} > 2，启用 ship JSON-RPC 批量广播；链上仍为多笔独立交易`);
+    const preparedShips: PreparedShip[] = [];
     for (const [index, position] of config.positions.entries()) {
-      await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger });
+      const prepared = await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger, batchShip });
+      if (prepared) preparedShips.push(prepared);
+    }
+    if (batchShip && !dryRun) {
+      await broadcastPreparedShips({ ships: preparedShips, publicClient, account, chain, rpcUrl, registry, logger });
     }
     logger.info(`${dryRun ? "添加 LP dry-run 完成" : "全部 LP 添加完成"}，仓位数=${config.positions.length}`);
   } finally {

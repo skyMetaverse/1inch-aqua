@@ -45,6 +45,8 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行仅在现有 allowance 未覆盖本次投入时尝试 `MAX_UINT256`。确认后脚本重新读取实际 allowance，只要该额度覆盖本次投入就继续；不会假设所有 ERC20 都原样存储 `MAX_UINT256`。所有非零且不足的 allowance 会先发送并确认 `approve(0)`，随后尝试最大授权，以兼容要求清零后才能修改额度的 ERC20。授权成功后 ship 失败时，授权仍会保留；脚本不会自动撤销授权。
 
+当 `positions` 数量超过 2 时，所有仓位完成 ship 模拟后会通过 JSON-RPC batch 一次提交多笔独立 raw transaction；这不是 Multicall3 单笔交易，仍会逐笔确认和复核。approve 仍保持顺序发送，批量 ship 部分成功时不会自动重发。
+
 ## 自动再平衡 Bot
 
 复制 `rebalance.example.jsonc` 为本地 `rebalance.jsonc` 后运行：
