@@ -9,6 +9,7 @@ import {
   calculatePercentAmount,
   convertDisplayRangeToAquaRange,
   FIXED_SCALE,
+  invertFixedPrice,
   parsePercentage,
   percentageToAquaFeeValue,
 } from "../src/domain/fixed.ts";
@@ -44,4 +45,10 @@ test("反向地址排序会精确翻转 Aqua raw 价格区间", () => {
 
 test("下浮 100% 被拒绝，防止生成零价格", () => {
   expect(() => calculateDisplayRange(FIXED_SCALE, "lower", undefined, parsePercentage("100%", "lower"))).toThrow("小于 100%");
+});
+
+test("倒数展示价格按 1e18 定点精确换向", () => {
+  expect(invertFixedPrice(FIXED_SCALE * 4n)).toBe(FIXED_SCALE / 4n);
+  expect(invertFixedPrice(FIXED_SCALE / 4n)).toBe(FIXED_SCALE * 4n);
+  expect(() => invertFixedPrice(0n)).toThrow("必须大于零");
 });

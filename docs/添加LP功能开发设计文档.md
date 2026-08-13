@@ -417,8 +417,10 @@ logs/2026-07-24 18-30-55.545.log
 - allowance 查询结果、是否已为最大值授权，以及本次采用的授权兼容规则。
 - 每笔清零授权和最大值授权的 token、spender、目标额度、交易 hash、receipt 状态、区块号和确认耗时。
 - EMSH current 请求参数、请求开始/结束时间、接口耗时、返回价格和接口时间戳。
-- current 价格的用户方向、Aqua 内部方向和精度。
-- `mode`、上下浮动百分比、用户可读区间、raw price 区间。
+- 仓位摘要：单边/双边模式、投入资产与余额比例、区间相对 current 的方向和百分比。
+- 配置 token 顺序的完整报价区间与 current 等式，例如 `1 token0 = N token1`。
+- 反向完整报价区间与 current 等式，例如 `1 token1 = N token0`，避免人工推倒数。
+- Aqua 内部方向、raw price 区间和精度，作为链上审计参数。
 - fee 原始配置、换算后的内部参数和精度校验结果。
 - strategy hash、ship 目标地址、交易 data 长度或安全摘要。
 - approve hash、receipt 状态、区块号和确认耗时。

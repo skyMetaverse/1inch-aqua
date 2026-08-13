@@ -23,6 +23,7 @@ import {
   convertDisplayRangeToAquaRange,
   FIXED_SCALE,
   formatFixed,
+  invertFixedPrice,
   parseDecimal,
   parsePercentage,
   percentageToAquaFeeValue,
@@ -222,8 +223,18 @@ async function addPosition(parameters: {
   const lowerPercent = position.range.lowerPercent ? parsePercentage(position.range.lowerPercent, "lowerPercent") : undefined;
   const displayRange = calculateDisplayRange(current, position.range.mode, upperPercent, lowerPercent);
   const aquaRange = convertDisplayRangeToAquaRange(token0, token1, displayRange);
-  logger.info(`价格区间：mode=${position.range.mode}，current=${formatFixed(displayRange.current)}，min=${formatFixed(displayRange.min)}，max=${formatFixed(displayRange.max)}，显示方向=${position.pair.tokens[1].symbol}/${position.pair.tokens[0].symbol}`);
-  logger.info(`Aqua 价格区间：方向=tokenGt/tokenLt，displayOrderCanonical=${aquaRange.isDisplayOrderCanonical}，rawPriceMin=${aquaRange.rawPriceMin.toString()}，rawPriceMax=${aquaRange.rawPriceMax.toString()}`);
+  const token0Config = position.pair.tokens[0];
+  const token1Config = position.pair.tokens[1];
+  const depositedToken = position.range.mode === "upper" ? token0Config : position.range.mode === "lower" ? token1Config : undefined;
+  const rangeDescription = position.range.mode === "upper"
+    ? `价格位于 current 上方，current 到上沿 +${position.range.upperPercent}`
+    : position.range.mode === "lower"
+      ? `价格位于 current 下方，下沿到 current +${position.range.lowerPercent}`
+      : `价格覆盖 current，下沿到 current +${position.range.lowerPercent}，current 到上沿 +${position.range.upperPercent}`;
+  logger.info(`仓位摘要：${position.range.mode === "upper" ? "上单边" : position.range.mode === "lower" ? "下单边" : "双边"}，${rangeDescription}，投入=${depositedToken ? `${depositedToken.symbol} ${depositedToken.balancePercent}` : `${token0Config.symbol} ${token0Config.balancePercent} + ${token1Config.symbol} ${token1Config.balancePercent}`}`);
+  logger.info(`配置报价区间：1 ${token0Config.symbol} = ${formatFixed(displayRange.min)} 至 ${formatFixed(displayRange.max)} ${token1Config.symbol}；current=1 ${token0Config.symbol} = ${formatFixed(displayRange.current)} ${token1Config.symbol}`);
+  logger.info(`反向报价区间：1 ${token1Config.symbol} = ${formatFixed(invertFixedPrice(displayRange.max))} 至 ${formatFixed(invertFixedPrice(displayRange.min))} ${token0Config.symbol}；current=1 ${token1Config.symbol} = ${formatFixed(invertFixedPrice(displayRange.current))} ${token0Config.symbol}`);
+  logger.info(`链上审计价格：Aqua 方向=tokenGt/tokenLt，displayOrderCanonical=${aquaRange.isDisplayOrderCanonical}，rawPriceMin=${aquaRange.rawPriceMin.toString()}，rawPriceMax=${aquaRange.rawPriceMax.toString()}`);
 
   const feePercent = parsePercentage(position.fee, "fee");
   const feeValue = percentageToAquaFeeValue(feePercent);

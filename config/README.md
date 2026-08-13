@@ -37,7 +37,7 @@ bun run add-lp config/lp.add.jsonc --dry-run
 bun run add-lp config/lp.add.jsonc --dry-run
 ```
 
-确认 `logs/` 中的代币、当前价格、区间、费率、strategy hash 和交易预览无误后，再去掉 `--dry-run` 真实执行：
+确认 `logs/` 中的仓位摘要、投入资产、配置报价与反向报价区间、费率、strategy hash 和交易预览无误后，再去掉 `--dry-run` 真实执行：
 
 ```bash
 bun run add-lp config/lp.add.jsonc

@@ -65,6 +65,15 @@ export function formatFixed(value: bigint, decimals = 18): string {
   return `${negative ? "-" : ""}${integer.toString()}${fraction ? `.${fraction}` : ""}`;
 }
 
+/**
+ * 将 1e18 定点价格转换为倒数报价，同样返回 1e18 定点值。
+ * 仅用于日志双向展示；向下取整且明确保留 raw 价格审计行，避免展示舍入影响真实策略参数。
+ */
+export function invertFixedPrice(price: bigint): bigint {
+  if (price <= 0n) throw new Error("倒数价格必须大于零");
+  return (FIXED_SCALE * FIXED_SCALE) / price;
+}
+
 /** 按余额百分比计算投入数量，并向下取整到代币 raw 单位。 */
 export function calculatePercentAmount(rawBalance: bigint, balancePercent: bigint): bigint {
   if (rawBalance < 0n) {
