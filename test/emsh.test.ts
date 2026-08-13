@@ -4,7 +4,7 @@
  * 主要流程：传入固定原始 JSON -> 提取价格字面量与时间戳 -> 断言精度和异常边界。
  */
 import { expect, test } from "bun:test";
-import { extractCurrentPrice } from "./emsh.ts";
+import { extractCurrentPrice } from "../src/infra/emsh.ts";
 
 test("保留 EMSH price 原始长小数字面量", () => {
   const value = extractCurrentPrice('{"data":{"result":{"timestamp":1786590299,"price":0.083131772471243631234567890}}}');

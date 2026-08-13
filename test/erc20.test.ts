@@ -4,7 +4,7 @@
  * 主要流程：构造确定性 allowance 状态 -> 生成 approve 步骤 -> 断言目标额度、交易数量和兼容原因。
  */
 import { expect, test } from "bun:test";
-import { buildMaximumApprovalSteps, ETHEREUM_USDT, MAX_UINT256 } from "./erc20.ts";
+import { buildMaximumApprovalSteps, ETHEREUM_USDT, MAX_UINT256 } from "../src/infra/erc20.ts";
 
 const registry = "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a" as const;
 const oneInch = "0x111111111117dc0aa78b770fa6a738034120c302" as const;

@@ -11,7 +11,7 @@ import {
   FIXED_SCALE,
   parsePercentage,
   percentageToAquaFeeValue,
-} from "./fixed.ts";
+} from "../src/domain/fixed.ts";
 
 test("0.001% 费率精确转换为 Aqua 内部值", () => {
   expect(percentageToAquaFeeValue(parsePercentage("0.001%", "fee"))).toBe(10_000n);

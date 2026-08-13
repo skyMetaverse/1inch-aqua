@@ -70,6 +70,7 @@
 ├── config/
 │   ├── lp.add.example.jsonc       # 添加 LP 示例配置
 │   └── README.md                  # 配置字段与单边规则说明
+├── test/                          # 所有单元与回归测试，按被测模块命名
 ├── scripts/
 │   ├── encrypt-private-key.ts      # 已有私钥加密和解密模块，保持不变
 │   └── cancel-all-active-lp.ts     # 当前优先实现：查询并串行 dock 当前 maker 的全部活跃仓位

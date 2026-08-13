@@ -1,13 +1,13 @@
 /**
- * 一键取消活跃 LP 脚本的本地签名回归测试。
- * 核心功能：验证私钥账户广播 dock 类交易时使用 eth_sendRawTransaction，而非要求 RPC 代签的 eth_sendTransaction。
- * 主要流程：构造固定测试私钥和捕获型 transport -> 调用本地签名函数 -> 断言 RPC 方法和 raw transaction 参数。
+ * 本地签名 RPC 广播模块的回归测试。
+ * 核心功能：验证私钥账户广播交易时使用 eth_sendRawTransaction，而非要求 RPC 代签的 eth_sendTransaction。
+ * 主要流程：构造固定测试私钥和捕获型 transport -> 调用共享本地签名函数 -> 断言 RPC 方法和 raw transaction 参数。
  */
 
 import { expect, test } from "bun:test";
 import { custom, defineChain, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { sendLocallySignedTransaction } from "./cancel-all-active-lp.ts";
+import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
 
 /** 测试专用链定义；不连接公共 RPC，也不携带任何真实账户或真实节点信息。 */
 const testChain = defineChain({

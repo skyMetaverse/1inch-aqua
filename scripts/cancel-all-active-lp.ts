@@ -15,7 +15,7 @@ import {
   HexString,
   NetworkEnum,
 } from "@1inch/aqua-sdk";
-import { createTransport, request, type Transport as WreqTransport } from "wreq-js";
+import { createTransport, fetch, type Transport as WreqTransport } from "wreq-js";
 import {
   createPublicClient,
   defineChain,
@@ -27,7 +27,6 @@ import {
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "./encrypt-private-key.ts";
-export { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
 import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
 
 const ENV_FILE = ".env";
@@ -151,8 +150,7 @@ function createApiHeaders(token?: string): Record<string, string> {
  * 关闭脚本只查询一次仓位列表，因此不需要跨运行缓存 token。
  */
 async function getAuthToken(transport: WreqTransport): Promise<string> {
-  const response = await request({
-    url: `${PROXY_API_BASE}/auth/token`,
+  const response = await fetch(`${PROXY_API_BASE}/auth/token`, {
     transport,
     headers: createApiHeaders(),
     method: "GET",
@@ -183,8 +181,7 @@ async function getOpenStrategies(
     limit: String(API_POSITION_LIMIT),
     chainId: String(chainId),
   });
-  const response = await request({
-    url: `${PROXY_API_BASE}/aqua/v1.0/strategies/makers/${maker}?${query.toString()}`,
+  const response = await fetch(`${PROXY_API_BASE}/aqua/v1.0/strategies/makers/${maker}?${query.toString()}`, {
     transport,
     headers: createApiHeaders(token),
     method: "GET",

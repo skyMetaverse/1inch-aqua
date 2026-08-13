@@ -4,7 +4,7 @@
  * 主要流程：使用公开地址和固定精确价格构建两次策略 -> 校验交易目标、hash 格式与策略唯一性。
  */
 import { expect, test } from "bun:test";
-import { buildConcentratedStrategy } from "./strategy.ts";
+import { buildConcentratedStrategy } from "../src/aqua/strategy.ts";
 
 test("构建 0.001% Aqua 集中流动性 ship 策略", () => {
   const input = {

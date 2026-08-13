@@ -7,8 +7,8 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readJsoncFile } from "./jsonc.ts";
-import { validateAddLpConfig } from "./lp-config.ts";
+import { readJsoncFile } from "../src/config/jsonc.ts";
+import { validateAddLpConfig } from "../src/config/lp-config.ts";
 
 const base = `{
   // 中文注释和尾随逗号都应受支持
