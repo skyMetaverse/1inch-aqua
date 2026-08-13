@@ -1,0 +1,47 @@
+{
+  // 目标网络链 ID。运行时会与 RPC 返回的 chainId 严格核对。
+  "chainId": 1,
+
+  // 本次要添加的 Aqua 集中流动性仓位。可配置多个，任一仓位失败时脚本停止后续广播。
+  "positions": [
+    {
+      "pair": {
+        // 必须恰好两个 ERC20。顺序定义可读价格：第一个代币用第二个代币计价。
+        // 此例表示：1 1INCH = N USDT。不要填写 native ETH，请使用 WETH 等 ERC20 地址。
+        "tokens": [
+          {
+            // 仅用于日志展示，链上代币信息以 address 查询结果为准。
+            "symbol": "1INCH",
+            "address": "0x111111111117dc0aa78b770fa6a738034120c302",
+
+            // 使用当前钱包该代币余额的百分比，范围是 0% 到 100%，支持小数。
+            "balancePercent": "30%"
+          },
+          {
+            "symbol": "USDT",
+            "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "balancePercent": "50%"
+          }
+        ]
+      },
+
+      // 按 Aqua 页面显示的实际费率填写，不填写 BPS。
+      // "0.001%" 创建的池子费率就是 0.001%。
+      // 当前 SDK 最小可精确表达精度是 0.0000001%。
+      "fee": "0.001%",
+
+      "range": {
+        // two-sided：实时价格位于上下边界之间。
+        // upper：上单边，区间从实时价格向上延伸；仅 tokens[0] 可配置非零 balancePercent。
+        // lower：下单边，区间从实时价格向下延伸；仅 tokens[1] 可配置非零 balancePercent。
+        "mode": "two-sided",
+
+        // 相对 EMSH current 实时价格向上浮动的百分比。可与下方不对称。
+        "upperPercent": "80%",
+
+        // 相对 EMSH current 实时价格向下浮动的百分比。必须小于 100%。
+        "lowerPercent": "30%"
+      }
+    }
+  ]
+}

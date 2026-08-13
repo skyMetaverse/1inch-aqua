@@ -45,6 +45,26 @@ try {
 
 当前只支持 v2 密文格式；不兼容旧 v1 密文。
 
+## 添加 LP
+
+添加 LP 使用带中文注释的 JSONC 文件。复制 [lp.add.example.jsonc](/Users/syskey/git/1inch-aqua/config/lp.add.example.jsonc) 为 `config/lp.add.jsonc`，填写 ERC20 地址、余额百分比、页面显示费率和单双边范围；完整字段规则见 [config/README.md](/Users/syskey/git/1inch-aqua/config/README.md)。
+
+添加脚本只使用 EMSH `current` 实时价格，以配置 token 顺序作为显示价格方向。价格、百分比、费率和区间全程使用 `bigint` 定点运算，核心交易计算不使用 JavaScript 浮点数。交易使用本地解密私钥签名，通过 RPC 的 `eth_sendRawTransaction` 广播。
+
+先执行 dry-run。它会读取实际余额、allowance、current 价格，计算区间并模拟 approve/ship，但不广播交易：
+
+```bash
+bun run add-lp config/lp.add.jsonc --dry-run
+```
+
+核对 `logs/` 中的价格、区间、投入数量、费率和 strategy hash 后，再真实执行：
+
+```bash
+bun run add-lp config/lp.add.jsonc
+```
+
+真实执行会使用最大授权；若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
+
 ## 一键取消全部活跃 LP 仓位
 
 脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。

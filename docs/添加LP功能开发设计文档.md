@@ -56,21 +56,20 @@
 │   ├── app/
 │   │   └── add-lp.ts              # 添加 LP 应用编排入口
 │   ├── config/
-│   │   ├── jsonc.ts               # JSONC 去注释和解析
-│   │   └── lp-config.ts            # 配置类型、结构校验和规范化
+│   │   ├── jsonc.ts               # JSONC 解析
+│   │   └── lp-config.ts           # 配置类型、结构校验和规范化
 │   ├── domain/
-│   │   ├── percentage.ts           # 百分比字符串解析与精确计算
-│   │   ├── price.ts                # 价格方向、区间和定点价格运算
-│   │   └── amount.ts               # decimals、余额百分比和 raw amount 计算
+│   │   └── fixed.ts               # 百分比、金额、费率、价格区间和方向的无损定点计算
 │   ├── infra/
-│   │   ├── erc20.ts                # ERC20 只读查询和交易编码
-│   │   ├── emsh.ts                 # EMSH current 接口适配
-│   │   ├── rpc.ts                  # RPC 客户端和交易确认
-│   │   └── logger.ts                # 统一中文日志与运行日志文件
-│   ├── aqua/
-│   │   └── strategy.ts             # Aqua 策略、最大授权、ship 构建适配
-│   └── wallet/
-│       └── private-key.ts          # 复用现有解密模块并管理敏感 Buffer 生命周期
+│   │   ├── erc20.ts               # ERC20 只读查询和最大授权交易编码
+│   │   ├── emsh.ts                # EMSH current 接口适配
+│   │   ├── rpc.ts                 # 本地签名 raw transaction 广播
+│   │   └── logger.ts              # 统一中文日志与运行日志文件
+│   └── aqua/
+│       └── strategy.ts             # Aqua 策略与 ship 构建适配
+├── config/
+│   ├── lp.add.example.jsonc       # 添加 LP 示例配置
+│   └── README.md                  # 配置字段与单边规则说明
 ├── scripts/
 │   ├── encrypt-private-key.ts      # 已有私钥加密和解密模块，保持不变
 │   └── cancel-all-active-lp.ts     # 当前优先实现：查询并串行 dock 当前 maker 的全部活跃仓位
@@ -204,7 +203,7 @@ JSONC 解析必须在读取后转换为标准对象，再进行严格结构校�
 配置 0.04%  = 4 bps
 ```
 
-SDK 当前底层编码还会把 BPS 转换为更细的固定整数。实现必须以已安装版本的真实编码结果为准，并为 `0.001%` 添加专门测试。
+当前安装的 SDK 实际编码为 `feePercent × 10^7` 的整数（等价于 `bps × 10^5`），允许范围为 0 到 1,000,000,000（100%）。已添加 `0.001% -> 10000 -> 0.1 bps` 的运行时策略构建测试；任何不能精确表示为该整数的费率都会在广播前拒绝。
 
 #### `range`
 
@@ -243,7 +242,10 @@ RPC_URL=https://your-rpc.example
 - 不实现 Chainlink 接口。
 - 不使用 `lastPrice`、缓存价格、旧价格或配置中的静态价格回退。
 - current 请求失败、返回为空、价格非法或时间信息不可信时，直接停止本仓位广播。
-- EMSH 的真实接口路径、请求参数和返回字段必须在实现时用真实请求复核，不能仅凭示例推断。
+- 当前实现最大接受数据年龄为 120 秒，最多允许 60 秒未来时间偏差；超出范围直接停止。
+- 已通过真实请求确认路径为 `GET /v2.0/charts/v1.0/chart/tradingview/{token0}/{token1}/86400/{chainId}/current`，响应为 `{"data":{"result":{"timestamp":...,"price":...}}}`。
+- 已通过同一非锚定交易对的正反 token 顺序请求确认：传入 `[token0, token1]` 时，`price` 表示 `1 token0 = N token1`；交换参数后返回倒数价格。
+- 服务端当前将 `price` 序列化为 JSON number。实现读取原始响应文本并提取该数字字面量，不经过 JSON 解析后的 JavaScript `number`；若接口改为科学计数法、空值、零值、负值或时间戳不可信，必须停止广播。
 
 ### 6.2 用户价格方向与 Aqua 方向
 
@@ -259,7 +261,9 @@ RPC_URL=https://your-rpc.example
 1 1INCH = N USDT
 ```
 
-Aqua SwapVM SDK 的集中流动性价格使用规范 token 排序下的 `P = tokenGt / tokenLt`。因此必须有独立的价格方向转换模块：
+Aqua SwapVM SDK 的集中流动性价格使用规范 token 排序下的 `P = tokenGt / tokenLt`。已通过当前安装的 SDK `ConcentrateGrowLiquidity2DArgs.fromRawPrices` 源码和官方 README 确认：`rawPriceMin`、`rawPriceMax` 直接是该人类价格比的 `1e18` 定点值，SDK 内部计算 `sqrt(P * 1e18)`；不应按两个 ERC20 的 `decimals` 再缩放。`decimals` 仅用于余额 raw amount 的读取和日志展示。
+
+因此必须有独立的价格方向转换模块：
 
 1. 根据地址确定 Aqua 的 `tokenLt` 和 `tokenGt`。
 2. 将 EMSH current 返回的用户方向价格转换为 SDK 方向。
@@ -310,7 +314,7 @@ formatFixed(value, scale)
 11. 计算用户可读区间。
 12. 转换为 Aqua SDK 价格方向和 raw price。
 13. 在日志中输出完整交易预览。
-14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata。
+14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata；每次构建使用 SDK 支持的 `uint64` 加密随机 salt，避免相同参数与已关闭策略重用同一 hash。
 15. 查询两个代币对 Aqua registry 的 allowance。
 16. allowance 不是最大值时，按代币兼容规则发送最大值授权，并等待每笔授权成功回执。
 17. 发送 ship 交易并等待成功回执。
@@ -459,6 +463,7 @@ logs/2026-07-24 18-30-55.545.log
 - `0%`、`100%`、小数百分比和超范围百分比。
 - raw balance 按百分比向下取整。
 - 费率 `0.001%`、`0.01%`、`0.04%` 和较大费率的精确转换。
+- 每次策略构建生成不同的 `uint64` salt 和 strategy hash。
 - 上下不对称区间。
 - `two-sided`、`upper`、`lower` 三种模式。
 - 下浮 `100%` 和负价格拒绝。
@@ -606,7 +611,7 @@ dock 旧策略 -> 等待确认 -> 构建新的 strategy bytes/hash -> 必要时�
 目录规划为以下迭代保留扩展点：
 
 - `price/`：增加其他价格源、价格源交叉校验和价格偏差策略。
-- `aqua/`：增加 dock、追加资金、读取已有策略和策略生命周期管理。
+- `aqua/`：增加追加资金、读取已有策略和策略生命周期管理。
 - `jobs/`：增加定时执行、重试策略和任务状态存储。
 - `portfolio/`：增加多钱包、多链和资产风险控制。
 - `logger/`：增加 JSON 日志、日志轮转和外部告警，但不改变业务层日志调用接口。
@@ -619,12 +624,9 @@ dock 旧策略 -> 等待确认 -> 构建新的 strategy bytes/hash -> 必要时�
 
 以下内容必须在编码时通过真实代码或真实请求确认：
 
-1. EMSH current 接口的准确 URL、query 参数和响应字段路径。
-2. EMSH current 价格的报价方向及其与用户 token 顺序的关系。
-3. EMSH 返回价格的字符串/数字类型和最大有效小数位；如服务端返回 JSON number，必须确认其是否已经产生精度损耗，并决定是否需要原始响应通道或服务端提供字符串字段。
-4. 当前安装的 Aqua SDK 对费率内部精度、最小值和最大值的真实编码边界。
-5. 所有目标链的 Aqua registry 和 SwapVM router 地址。
-6. 非 Ethereum 主网 USDT 或其他非标准 ERC20 的最大授权兼容规则及其合约行为。
-7. RPC 是否支持交易回执等待、链 ID 查询和必要的 eth_call。
+1. EMSH 服务端 JSON number 在服务端序列化前是否已经损失超过其数字字面量的精度；当前客户端已避免二次 JavaScript 浮点损失，但无法恢复服务端此前的精度截断。
+2. 所有目标链的 Aqua registry 和 SwapVM router 地址。
+3. 非 Ethereum 主网 USDT 或其他非标准 ERC20 的最大授权兼容规则及其合约行为。
+4. RPC 是否支持交易回执等待、链 ID 查询、必要的 eth_call 和 `eth_sendRawTransaction`。
 
 未确认前不应把示例返回值当作稳定接口契约，也不应广播真实资产交易。

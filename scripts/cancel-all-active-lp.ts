@@ -18,17 +18,17 @@ import {
 import { createTransport, request, type Transport as WreqTransport } from "wreq-js";
 import {
   createPublicClient,
-  createWalletClient,
   defineChain,
   http,
   isAddress,
   type Address as ViemAddress,
   type Chain,
   type Hex,
-  type Transport as ViemTransport,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "./encrypt-private-key.ts";
+export { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
+import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
 
 const ENV_FILE = ".env";
 const RPC_URL_FIELD = "RPC_URL";
@@ -350,28 +350,6 @@ async function verifyDockedRawBalances(
       throw new Error(`关闭后链上状态不符合预期：token=${token}，余额=${rawBalance.toString()}，tokensCount=${tokensCount}`);
     }
   }
-}
-
-/**
- * 本地签名并通过 eth_sendRawTransaction 广播交易。
- * 绝不能把裸地址作为 account 传给 viem，否则会退化为要求 RPC 节点代签的 eth_sendTransaction。
- */
-export async function sendLocallySignedTransaction(
-  account: PrivateKeyAccount,
-  chain: Chain,
-  transport: ViemTransport,
-  transaction: {
-    to: ViemAddress;
-    data: Hex;
-    value: bigint;
-    nonce?: number;
-    gas?: bigint;
-    maxFeePerGas?: bigint;
-    maxPriorityFeePerGas?: bigint;
-  },
-): Promise<Hex> {
-  const walletClient = createWalletClient({ account, chain, transport });
-  return walletClient.sendTransaction(transaction);
 }
 
 /**
