@@ -451,7 +451,8 @@ async function cancelStrategiesWithMulticall(parameters: {
   }
   const multicall = buildAquaMulticallTransaction(parameters.registry, prepared.map((item) => item.dock));
   await parameters.publicClient.call({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
-  parameters.logger.info(`批量 multicall dock 链上模拟成功：子调用数=${prepared.length}，data 字节数=${(multicall.data.length - 2) / 2}`);
+  const estimatedGas = await parameters.publicClient.estimateGas({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
+  parameters.logger.info(`批量 multicall dock 链上模拟成功：子调用数=${prepared.length}，data 字节数=${(multicall.data.length - 2) / 2}，估算 gas=${estimatedGas.toString()}`);
   if (parameters.dryRun) {
     parameters.logger.info(`dry-run 模式：未广播 multicall dock，子调用数=${prepared.length}`);
     return;

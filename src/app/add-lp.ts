@@ -354,7 +354,8 @@ async function broadcastPreparedShips(parameters: {
   }
   const multicall = buildAquaMulticallTransaction(parameters.registry, parameters.ships.map((ship) => ship.built.ship));
   await parameters.publicClient.call({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
-  parameters.logger.info(`批量 multicall ship 链上模拟成功：子调用数=${parameters.ships.length}，data 字节数=${(multicall.data.length - 2) / 2}`);
+  const estimatedGas = await parameters.publicClient.estimateGas({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
+  parameters.logger.info(`批量 multicall ship 链上模拟成功：子调用数=${parameters.ships.length}，data 字节数=${(multicall.data.length - 2) / 2}，估算 gas=${estimatedGas.toString()}`);
   if (parameters.dryRun) {
     parameters.logger.info(`dry-run：未广播 multicall ship，子调用数=${parameters.ships.length}`);
     return;
@@ -395,7 +396,7 @@ async function main(): Promise<void> {
     logger.info(`RPC 与 Aqua registry 校验成功：chainId=${rpcChainId}，registry=${registry}`);
 
     const batchShip = config.positions.length > 2;
-    if (batchShip && !dryRun) logger.info(`仓位数=${config.positions.length} > 2，启用单笔 atomic multicall ship；任一子调用失败会整批回滚`);
+    if (batchShip) logger.info(`仓位数=${config.positions.length} > 2，启用单笔 atomic multicall ship${dryRun ? " dry-run 模拟" : ""}；任一子调用失败会整批回滚`);
     const preparedShips: PreparedShip[] = [];
     for (const [index, position] of config.positions.entries()) {
       const prepared = await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger, batchShip });

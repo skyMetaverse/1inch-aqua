@@ -327,7 +327,7 @@ formatFixed(value, scale)
 14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata；每次构建使用 SDK 支持的 `uint64` 加密随机 salt，避免相同参数与已关闭策略重用同一 hash。
 15. 查询两个代币对 Aqua registry 的 allowance。
 16. allowance 不是最大值时，按代币兼容规则发送最大值授权，并等待每笔授权成功回执。
-17. 当配置仓位数不超过 2 时逐笔发送 ship；超过 2 时，全部仓位完成单笔 ship 模拟、授权确认和按 token 汇总余额复核后，构建并模拟一笔 Aqua registry `multicall([ship...])`，再本地签名广播。multicall 任一子调用失败会整批回滚；成功后在同一 receipt 中逐策略验证事件和 `rawBalances`。
+17. 当配置仓位数不超过 2 时逐笔发送 ship；超过 2 时，全部仓位完成单笔 ship 模拟、授权确认和按 token 汇总余额复核后，构建并模拟、估算 gas 一笔 Aqua registry `multicall([ship...])`，再本地签名广播。multicall 任一子调用失败会整批回滚；成功后在同一 receipt 中逐策略验证事件和 `rawBalances`。
 18. 输出交易哈希、区块号、策略哈希、投入数量、价格和区间。
 19. 清理敏感 Buffer，记录本次运行结果。
 
@@ -527,7 +527,7 @@ logs/2026-07-24 18-30-55.545.log
 4. 使用仓位返回的原始 `app` 构建 dock，避免用固定 router 地址覆盖仓位创建时的 app。
 5. 在广播前读取每个 token 的 `rawBalances` 并使用 `eth_call` 模拟 dock。
 6. 使用解密私钥派生的本地 `PrivateKeyAccount` 签名，通过 RPC 的 `eth_sendRawTransaction` 广播；广播前显式读取 pending nonce、估算 gas 和 EIP-1559 fee，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`；禁止将裸 maker 地址作为账户传给 `viem`，以免错误调用节点代签的 `eth_sendTransaction`。
-7. 仓位数不超过两个时串行关闭；超过两个时，在每个 dock 预检和单笔模拟通过后，再模拟并广播单笔 `multicall([dock...])`。multicall 任一子调用失败时整批回滚，不会部分关闭。
+7. 仓位数不超过两个时串行关闭；超过两个时，在每个 dock 预检和单笔模拟通过后，再模拟并估算 gas，最后广播单笔 `multicall([dock...])`。multicall 任一子调用失败时整批回滚，不会部分关闭。
 8. 串行模式下每笔成功交易、multicall 模式下每个子策略，均必须通过 receipt status、目标 `Docked` 事件和关闭后的 `rawBalances` 状态复核。
 9. 只关闭仓位，不撤销 ERC20 allowance；撤销授权保留为独立后续操作。
 10. 当接口返回数量达到当前 `limit=100` 时立即失败，避免在未确认分页语义时仅关闭前 100 个仓位。
