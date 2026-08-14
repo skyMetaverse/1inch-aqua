@@ -47,6 +47,16 @@ bun run add-lp config/lp.add.jsonc
 
 当 `positions` 数量超过 2 时，所有仓位完成 ship 模拟后会为每笔 ship 分配连续 nonce 并按 nonce 顺序流水线提交独立 raw transaction，不等待前一笔区块确认；这不是 Multicall3 单笔交易，仍会逐笔确认和复核。approve 仍保持顺序发送。任一 ship 广播失败时不再提交后续 nonce，已成功交易先完成复核且不会自动重发。
 
+## LP 只读价格检查
+
+针对 `1INCH/WBTC`、`1INCH/cbBTC`、`1INCH/USDT`，可先执行不解密私钥的本地只读检查：
+
+```bash
+bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 config/lp.add.jsonc
+```
+
+脚本只查询 RPC、EMSH、官方 Pair/策略 API，输出链上 decimals、余额、计划投入 raw amount、价格区间、decimals-aware sqrt 参数、已有策略的 rawBalances 和区间；不会模拟交易，不会发送任何交易。
+
 ## 自动再平衡 Bot
 
 复制 `rebalance.example.jsonc` 为本地 `rebalance.jsonc` 后运行：

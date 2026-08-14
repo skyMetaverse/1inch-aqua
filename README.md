@@ -101,6 +101,16 @@ bun run cancel-all-active-lp
 bun run cancel-all-active-lp --help
 ```
 
+## LP 只读价格检查
+
+针对 `1INCH/WBTC`、`1INCH/cbBTC`、`1INCH/USDT`，可以先执行本地只读检查。脚本要求显式传入 maker 地址，不读取或解密私钥；只查询 RPC 的链上 `decimals`、余额、allowance、Aqua `rawBalances`，以及 EMSH current 和官方 Pair/策略 API。它不会调用交易模拟，不会发送 `approve`、`dock`、`ship` 或 `eth_sendRawTransaction`。
+
+```bash
+bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 config/lp.add.jsonc
+```
+
+日志会分别输出三个交易对的链上余额和计划投入 raw amount、EMSH current、配置价格区间、decimals-aware `sqrtPriceMin/Max`、sqrt 回读覆盖校验、Pair 市场交叉价格，以及已有 active 策略的 Aqua raw balance 和区间。只有三个目标 pair 都完成只读检查后才会正常退出；任何一个区间不能表达或回读不覆盖目标时会失败退出。
+
 ## 自动再平衡 Bot
 
 Bot 监控 1inch 官方策略 API 返回的当前 maker 全部受支持 active concentrated 仓位，以策略 API 的 `currentBalance` 判断当前资产状态，以 Pair API 判断市场活跃度，以 EMSH current 计算新的 5 bp 区间。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足连续越界、冷却期、市场活跃度和价格交叉校验条件时自动执行 `dock -> ship`。
