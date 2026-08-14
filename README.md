@@ -109,7 +109,7 @@ bun run cancel-all-active-lp --help
 bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 config/lp.add.jsonc
 ```
 
-日志会分别输出三个交易对的链上余额和计划投入 raw amount、EMSH current、配置价格区间、decimals-aware `sqrtPriceMin/Max`、sqrt 回读覆盖校验、Pair 市场交叉价格，以及已有 active 策略的 Aqua raw balance 和区间。只有三个目标 pair 都完成只读检查后才会正常退出；任何一个区间不能表达或回读不覆盖目标时会失败退出。
+日志会分别输出三个交易对的链上余额和计划投入 raw amount、EMSH current、配置价格区间、decimals-aware `sqrtPriceMin/Max`、sqrt 回读量化误差、Pair 市场交叉价格，以及已有 active 策略的 Aqua raw balance 和区间。只有三个目标 pair 都完成只读检查后才会正常退出；任一 sqrt 区间不能表达，或 Pair/EMSH 偏差超过该仓位最窄单侧宽度时都会失败退出，禁止将该次快照用于真实资金建仓。
 
 ## 自动再平衡 Bot
 

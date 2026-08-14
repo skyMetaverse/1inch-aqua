@@ -93,6 +93,19 @@ function relativePercent(error: bigint, reference: bigint): bigint {
   return (error * 100n * 10n ** 18n) / reference;
 }
 
+/**
+ * Pair/EMSH 的交叉价格偏差不得超过当前配置最窄单侧宽度。
+ * 该只读检查专门保护窄区间建仓：即使 sqrt 编码正确，外部市场已离开目标边界也会立刻带来成交风险。
+ */
+function maximumPairDeviation(position: PositionConfig): bigint {
+  const upper = position.range.upperPercent ? parsePercentage(position.range.upperPercent, "upperPercent") : undefined;
+  const lower = position.range.lowerPercent ? parsePercentage(position.range.lowerPercent, "lowerPercent") : undefined;
+  if (position.range.mode === "upper" && upper) return upper;
+  if (position.range.mode === "lower" && lower) return lower;
+  if (position.range.mode === "two-sided" && upper && lower) return upper < lower ? upper : lower;
+  throw new Error(`无法确定 ${tokenLabel(position)} 的市场偏差门槛`);
+}
+
 function logDisplayRange(logger: Logger, position: PositionConfig, current: bigint, range: { min: bigint; max: bigint }): void {
   logger.info(`配置区间：1 ${position.pair.tokens[0].symbol} = ${formatFixed(range.min)} 至 ${formatFixed(range.max)} ${position.pair.tokens[1].symbol}；current=${formatFixed(current)}；反向=${formatFixed(invertFixedPrice(range.max))} 至 ${formatFixed(invertFixedPrice(range.min))} ${position.pair.tokens[0].symbol}`);
 }
@@ -142,7 +155,7 @@ async function checkPosition(parameters: {
   position: PositionConfig;
   market: Awaited<ReturnType<typeof getPairMarkets>>[number];
   strategies: ApiStrategy[];
-}): Promise<void> {
+}): Promise<boolean> {
   const { logger, client, registry, chainId, maker, position, market, strategies } = parameters;
   const target = matchingTarget(position);
   if (!target) throw new Error(`配置仓位不是目标顺序的 1INCH/WBTC、1INCH/cbBTC 或 1INCH/USDT：${tokenLabel(position)}`);
@@ -176,9 +189,14 @@ async function checkPosition(parameters: {
   logger.info(`sqrt 回读校验：恢复区间=${formatFixed(recovered.min)}-${formatFixed(recovered.max)}，下界相对误差=${formatFixed(minError)}%，上界相对误差=${formatFixed(maxError)}%，允许量化误差=${formatFixed(MAX_SQRT_ROUNDING_ERROR_PERCENT)}%，结果=${quantizationOkay ? "通过" : "失败"}`);
   const marketPrice = parseDecimal(String(market.lastPrice), 18, `${target} Pair lastPrice`);
   const difference = marketPrice > currentResult.value ? marketPrice - currentResult.value : currentResult.value - marketPrice;
-  logger.info(`官方 Pair 市场交叉检查：lastPrice=${market.lastPrice}，与 EMSH 偏差=${formatFixed((difference * 100n * 10n ** 18n) / currentResult.value)}%（仅观察，不作为下单价格）`);
+  const marketDeviation = relativePercent(difference, currentResult.value);
+  const maximumDeviation = maximumPairDeviation(position);
+  const marketCoherent = marketDeviation <= maximumDeviation;
+  logger.info(`官方 Pair 市场交叉检查：lastPrice=${market.lastPrice}，与 EMSH 偏差=${formatFixed(marketDeviation)}%，允许最大偏差=${formatFixed(maximumDeviation)}%，结果=${marketCoherent ? "通过" : "失败"}`);
   await printExistingStrategies(logger, client, registry, strategies, target, position);
-  logger.info(`安全结论：${quantizationOkay ? "当前 decimals-aware sqrt 区间可表达，未发现计算层套利倍率错误" : "sqrt 区间量化误差超限，禁止使用该配置"}`);
+  const safe = quantizationOkay && marketCoherent;
+  logger.info(`安全结论：${safe ? "当前 decimals-aware sqrt 区间可表达，且市场价格交叉检查通过" : "禁止使用真实资金：sqrt 参数或市场价格交叉检查未通过"}`);
+  return safe;
 }
 
 async function main(): Promise<void> {
@@ -200,12 +218,14 @@ async function main(): Promise<void> {
   if (positions.length !== TARGETS.size) throw new Error(`配置中目标仓位数量=${positions.length}，必须恰好包含 WBTC、cbBTC、USDT 三个 1INCH pair`);
   const pairs = positions.map((position) => [position.pair.tokens[0].address, position.pair.tokens[1].address] as [Address, Address]);
   const [markets, strategies] = await Promise.all([getPairMarkets(chainId, pairs), getActiveStrategies(maker, chainId)]);
+  let allSafe = true;
   for (const [index, position] of positions.entries()) {
     const market = markets[index];
     if (!market) throw new Error(`缺少第 ${index + 1} 个目标 pair 的市场数据`);
-    await checkPosition({ logger, client, registry, chainId, maker, position, market, strategies });
+    allSafe = (await checkPosition({ logger, client, registry, chainId, maker, position, market, strategies })) && allSafe;
   }
-  logger.info("========== 只读检查完成：没有授权、dock、ship、eth_sendRawTransaction ==========");
+  if (!allSafe) throw new Error("只读检查发现至少一个目标 pair 的价格交叉或 sqrt 参数未通过，禁止使用真实资金");
+  logger.info("========== 只读检查完成：三组参数均通过；没有授权、dock、ship、eth_sendRawTransaction ==========");
 }
 
 if (import.meta.main) {

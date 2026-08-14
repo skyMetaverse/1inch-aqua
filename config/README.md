@@ -55,7 +55,7 @@ bun run add-lp config/lp.add.jsonc
 bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 config/lp.add.jsonc
 ```
 
-脚本只查询 RPC、EMSH、官方 Pair/策略 API，输出链上 decimals、余额、计划投入 raw amount、价格区间、decimals-aware sqrt 参数、已有策略的 rawBalances 和区间；不会模拟交易，不会发送任何交易。
+脚本只查询 RPC、EMSH、官方 Pair/策略 API，输出链上 decimals、余额、计划投入 raw amount、价格区间、decimals-aware sqrt 参数、已有策略的 rawBalances 和区间；不会模拟交易，不会发送任何交易。除了 sqrt 区间可表达外，它还要求 Pair/EMSH 偏差不超过配置最窄单侧宽度；任一目标 pair 不满足时以失败状态退出。
 
 ## 自动再平衡 Bot
 
