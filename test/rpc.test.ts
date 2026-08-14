@@ -83,6 +83,32 @@ test("流水线广播在中间 nonce 失败时不提交后续交易", async () =
   expect(results[2]?.error).toContain("未提交");
 });
 
+test("raw 广播拒绝时记录阶段和安全交易参数，不自动重试", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  let rawRequestCount = 0;
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0xc";
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x3b9aca00";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" } as unknown as Hex;
+      if (args.method === "eth_sendRawTransaction") {
+        rawRequestCount += 1;
+        throw new Error("Missing or invalid parameters.");
+      }
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  await expect(sendLocallySignedTransaction(testAccount, testChain, transport, {
+    to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a",
+    data: "0x28defc17",
+    value: 0n,
+  })).rejects.toThrow("raw 广播失败：nonce=12，gas=100000，maxFeePerGas=2200000000，maxPriorityFeePerGas=1000000000，原因=Missing or invalid parameters.");
+  expect(rawRequestCount).toBe(1);
+  expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
+});
+
 test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () => {
   const requests: Array<{ method: string; params?: unknown[] }> = [];
   const transport = custom({

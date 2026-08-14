@@ -21,9 +21,26 @@ export interface BatchBroadcastResult {
   error?: string;
 }
 
-/** 只保留错误首行，避免把 RPC 可能包含的大段原始响应重复写入终端日志。 */
+/**
+ * 只提取 RPC 错误的短文本，避免把可能包含 URL、raw transaction 或完整响应的大段内容写入日志。
+ * viem 有时把节点错误包成通用顶层 message，真实原因位于 details 或 cause，因此必须有限深度地向内查找。
+ */
 function firstErrorLine(error: unknown): string {
-  return error instanceof Error ? error.message.split("\n")[0]?.trim() || "未知错误" : "未知错误";
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object" && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const value = current as { message?: unknown; details?: unknown; cause?: unknown };
+    for (const candidate of [value.details, value.message]) {
+      if (typeof candidate !== "string") continue;
+      const line = candidate.split("\n")[0]?.trim();
+      if (line && !messages.includes(line)) messages.push(line);
+    }
+    current = value.cause;
+  }
+  // 优先选择不是 viem 通用包装文本的节点原因；没有更具体信息时才回退到第一条。
+  return messages.find((message) => !/^An unknown RPC error occurred\.?$/i.test(message)) ?? messages[0] ?? "未知错误";
 }
 
 /** 使用明确参数构建一笔本地签名交易，避免 viem 隐式调用 eth_fillTransaction。 */
@@ -65,16 +82,41 @@ export async function sendLocallySignedTransaction(
   transaction: TransactionRequest,
 ): Promise<Hex> {
   const publicClient = createPublicClient({ chain, transport });
+  let nonce: number;
   try {
-    const nonce = transaction.nonce ?? await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
-    const gas = transaction.gas ?? await publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value });
-    const fees = transaction.maxFeePerGas !== undefined && transaction.maxPriorityFeePerGas !== undefined
+    nonce = transaction.nonce ?? await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+  } catch (error) {
+    throw new Error(`读取 pending nonce 失败：${firstErrorLine(error)}`);
+  }
+
+  let gas: bigint;
+  try {
+    gas = transaction.gas ?? await publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value });
+  } catch (error) {
+    throw new Error(`估算 gas 失败：nonce=${nonce}，原因=${firstErrorLine(error)}`);
+  }
+
+  let fees: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint };
+  try {
+    fees = transaction.maxFeePerGas !== undefined && transaction.maxPriorityFeePerGas !== undefined
       ? { maxFeePerGas: transaction.maxFeePerGas, maxPriorityFeePerGas: transaction.maxPriorityFeePerGas }
       : await publicClient.estimateFeesPerGas();
-    const serialized = await signPreparedTransaction(account, chain, transaction, nonce, gas, fees);
+  } catch (error) {
+    throw new Error(`估算 EIP-1559 fee 失败：nonce=${nonce}，gas=${gas}，原因=${firstErrorLine(error)}`);
+  }
+
+  let serialized: Hex;
+  try {
+    serialized = await signPreparedTransaction(account, chain, transaction, nonce, gas, fees);
+  } catch (error) {
+    throw new Error(`本地签名失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${fees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${fees.maxPriorityFeePerGas ?? "unknown"}，原因=${firstErrorLine(error)}`);
+  }
+
+  try {
+    // raw 广播一旦得到网络级错误，节点接收状态不可假设；禁止自动重试，交由调用方只读确认后决定下一次操作。
     return await publicClient.request({ method: "eth_sendRawTransaction", params: [serialized] }, { retryCount: 0 });
   } catch (error) {
-    throw new Error(`本地签名交易准备或 raw 广播失败：${firstErrorLine(error)}`);
+    throw new Error(`raw 广播失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${fees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${fees.maxPriorityFeePerGas ?? "unknown"}，原因=${firstErrorLine(error)}`);
   }
 }
 
