@@ -16,8 +16,8 @@ export interface PersistedPlan {
   sourceCurrentRaw: [string, string];
   targetMode: "upper" | "lower" | "two-sided";
   targetAmountsRaw: [string, string];
-  targetRawPriceMin: string;
-  targetRawPriceMax: string;
+  targetSqrtPriceMin: string;
+  targetSqrtPriceMax: string;
   fee: string;
   salt: string;
   shipStrategyHash: string;
@@ -30,7 +30,7 @@ export interface PersistedPlan {
   blockedReason?: string;
 }
 export interface RebalanceObservation { strategyHash: string; breachCount: number; lastShipAt?: number; }
-export interface StateDocument { version: 1; plans: Record<string, PersistedPlan>; observations: Record<string, RebalanceObservation>; }
+export interface StateDocument { version: 2; plans: Record<string, PersistedPlan>; observations: Record<string, RebalanceObservation>; }
 
 /** 原子写入前进行最小结构校验，防止损坏或手工篡改状态被自动执行器采用。 */
 function validatePlan(value: unknown, key: string): PersistedPlan {
@@ -45,18 +45,26 @@ function validatePlan(value: unknown, key: string): PersistedPlan {
   if (!Number.isSafeInteger(createdAt) || !Number.isSafeInteger(updatedAt)) throw new Error(`状态计划 ${key} 时间戳无效`);
   const safeCreatedAt = createdAt as number; const safeUpdatedAt = updatedAt as number;
   const salt = text("salt"); if (!/^(?:0|[1-9]\d*)$/.test(salt)) throw new Error(`状态计划 ${key}.salt 必须是非负整数字符串`);
-  return { logicalPositionKey: text("logicalPositionKey"), sourceStrategyHash: text("sourceStrategyHash"), sourceStrategyBytes: text("sourceStrategyBytes"), sourceApp: text("sourceApp"), tokens: tokens as [string, string], sourceCurrentRaw: rawPair("sourceCurrentRaw"), targetMode: mode, targetAmountsRaw: rawPair("targetAmountsRaw"), targetRawPriceMin: text("targetRawPriceMin"), targetRawPriceMax: text("targetRawPriceMax"), fee: text("fee"), salt, shipStrategyHash: text("shipStrategyHash"), decisionReason: text("decisionReason"), createdAt: safeCreatedAt, updatedAt: safeUpdatedAt, stage: stage as PlanStage, ...(typeof plan.dockTransactionHash === "string" ? { dockTransactionHash: plan.dockTransactionHash } : {}), ...(typeof plan.shipTransactionHash === "string" ? { shipTransactionHash: plan.shipTransactionHash } : {}), ...(typeof plan.blockedReason === "string" ? { blockedReason: plan.blockedReason } : {}) };
+  const targetSqrtPriceMin = text("targetSqrtPriceMin");
+  const targetSqrtPriceMax = text("targetSqrtPriceMax");
+  if (!/^(?:0|[1-9]\d*)$/.test(targetSqrtPriceMin) || !/^(?:0|[1-9]\d*)$/.test(targetSqrtPriceMax) || BigInt(targetSqrtPriceMin) <= 0n || BigInt(targetSqrtPriceMin) >= BigInt(targetSqrtPriceMax)) {
+    throw new Error(`状态计划 ${key}.targetSqrtPrice 区间无效`);
+  }
+  return { logicalPositionKey: text("logicalPositionKey"), sourceStrategyHash: text("sourceStrategyHash"), sourceStrategyBytes: text("sourceStrategyBytes"), sourceApp: text("sourceApp"), tokens: tokens as [string, string], sourceCurrentRaw: rawPair("sourceCurrentRaw"), targetMode: mode, targetAmountsRaw: rawPair("targetAmountsRaw"), targetSqrtPriceMin, targetSqrtPriceMax, fee: text("fee"), salt, shipStrategyHash: text("shipStrategyHash"), decisionReason: text("decisionReason"), createdAt: safeCreatedAt, updatedAt: safeUpdatedAt, stage: stage as PlanStage, ...(typeof plan.dockTransactionHash === "string" ? { dockTransactionHash: plan.dockTransactionHash } : {}), ...(typeof plan.shipTransactionHash === "string" ? { shipTransactionHash: plan.shipTransactionHash } : {}), ...(typeof plan.blockedReason === "string" ? { blockedReason: plan.blockedReason } : {}) };
 }
 
 export function loadRebalanceState(path: string): StateDocument {
-  if (!existsSync(path)) return { version: 1, plans: {}, observations: {} };
+  if (!existsSync(path)) return { version: 2, plans: {}, observations: {} };
   let parsed: unknown; try { parsed = JSON.parse(readFileSync(path, "utf8")); } catch { throw new Error(`状态文件无法解析：${path}`); }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("状态文件根节点必须是对象");
-  const root = parsed as Record<string, unknown>; if (root.version !== 1 || typeof root.plans !== "object" || root.plans === null || Array.isArray(root.plans) || typeof root.observations !== "object" || root.observations === null || Array.isArray(root.observations)) throw new Error("状态文件版本、plans 或 observations 无效");
+  const root = parsed as Record<string, unknown>;
+  // v1 只保存 rawPrice，mixed-decimals 策略无法由它无损重建 sqrt 区间；宁可人工审计，也不能自动恢复交易。
+  if (root.version === 1) throw new Error("状态文件为 v1 rawPrice 格式，无法安全恢复 mixed-decimals 计划；请人工核对后归档该 state 文件");
+  if (root.version !== 2 || typeof root.plans !== "object" || root.plans === null || Array.isArray(root.plans) || typeof root.observations !== "object" || root.observations === null || Array.isArray(root.observations)) throw new Error("状态文件版本、plans 或 observations 无效");
   const plans: Record<string, PersistedPlan> = {}; for (const [key, value] of Object.entries(root.plans as Record<string, unknown>)) plans[key] = validatePlan(value, key);
   const observations: Record<string, RebalanceObservation> = {};
   for (const [key, value] of Object.entries(root.observations as Record<string, unknown>)) { if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`状态观测 ${key} 必须是对象`); const item = value as Record<string, unknown>; if (typeof item.strategyHash !== "string" || !Number.isSafeInteger(item.breachCount) || (item.breachCount as number) < 0 || (item.lastShipAt !== undefined && !Number.isSafeInteger(item.lastShipAt))) throw new Error(`状态观测 ${key} 无效`); observations[key] = { strategyHash: item.strategyHash, breachCount: item.breachCount as number, ...(item.lastShipAt === undefined ? {} : { lastShipAt: item.lastShipAt as number }) }; }
-  return { version: 1, plans, observations };
+  return { version: 2, plans, observations };
 }
 
 /** 使用临时文件、fsync 与 rename 防止进程被中断时留下半个 JSON。 */

@@ -8,7 +8,9 @@ import {
   calculateDisplayRange,
   calculatePercentAmount,
   convertAquaRangeToDisplayRange,
+  convertAquaSqrtRangeToDisplayRange,
   convertDisplayRangeToAquaRange,
+  convertDisplayRangeToAquaSqrtRange,
   FIXED_SCALE,
   invertFixedPrice,
   parseDecimalFloor,
@@ -60,6 +62,36 @@ test("反向地址排序会精确翻转 Aqua raw 价格区间", () => {
   expect(minError).toBeLessThan(10n ** 7n);
   expect(maxError).toBeLessThan(10n ** 7n);
   expect(displayRange.min).toBeLessThan(displayRange.max);
+});
+
+test("mixed-decimals 区间使用 sqrtPrice 保留 1INCH/WBTC 的窄区间", () => {
+  const oneInch = "0x111111111117dc0aa78b770fa6a738034120c302";
+  const wbtc = "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599";
+  const range = { current: 1_327_182_096_733n, min: 1_326_385_787_474n, max: 1_327_182_096_733n };
+  const aquaRange = convertDisplayRangeToAquaSqrtRange(oneInch, 18, wbtc, 8, range);
+  // 旧 rawPrice 直接编码会是 1.3e12；正确 sqrt 约为 1.15e10，且仍区分 6bp 边界。
+  expect(aquaRange.sqrtPriceMin).toBeLessThan(aquaRange.sqrtPriceMax);
+  expect(aquaRange.sqrtPriceMax).toBe(11_520_338_956n);
+  const recovered = convertAquaSqrtRangeToDisplayRange(oneInch, 18, wbtc, 8, aquaRange);
+  expect(recovered.min).toBeLessThan(recovered.max);
+  const minError = range.min > recovered.min ? range.min - recovered.min : recovered.min - range.min;
+  const maxError = range.max > recovered.max ? range.max - recovered.max : recovered.max - range.max;
+  expect(minError).toBeLessThan(1_000n);
+  expect(maxError).toBeLessThan(1_000n);
+});
+
+test("mixed-decimals 反向 token 顺序仍按人类报价恢复区间", () => {
+  const usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+  const oneInch = "0x111111111117dc0aa78b770fa6a738034120c302";
+  const range = { current: 83_418_000_000_000_000n, min: 83_376_291_000_000_000n, max: 83_459_709_000_000_000n };
+  const aquaRange = convertDisplayRangeToAquaSqrtRange(usdt, 6, oneInch, 18, range);
+  const recovered = convertAquaSqrtRangeToDisplayRange(usdt, 6, oneInch, 18, aquaRange);
+  expect(aquaRange.isDisplayOrderCanonical).toBe(false);
+  expect(recovered.min).toBeLessThan(recovered.max);
+  const minError = range.min > recovered.min ? range.min - recovered.min : recovered.min - range.min;
+  const maxError = range.max > recovered.max ? range.max - recovered.max : recovered.max - range.max;
+  expect(minError).toBeLessThan(1_000_000n);
+  expect(maxError).toBeLessThan(1_000_000n);
 });
 
 test("下浮 100% 被拒绝，防止生成零价格", () => {

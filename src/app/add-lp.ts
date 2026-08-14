@@ -20,7 +20,7 @@ import { validateAddLpConfig, type PositionConfig } from "../config/lp-config.ts
 import {
   calculateDisplayRange,
   calculatePercentAmount,
-  convertDisplayRangeToAquaRange,
+  convertDisplayRangeToAquaSqrtRange,
   FIXED_SCALE,
   formatFixed,
   invertFixedPrice,
@@ -234,7 +234,8 @@ async function addPosition(parameters: {
   const upperPercent = position.range.upperPercent ? parsePercentage(position.range.upperPercent, "upperPercent") : undefined;
   const lowerPercent = position.range.lowerPercent ? parsePercentage(position.range.lowerPercent, "lowerPercent") : undefined;
   const displayRange = calculateDisplayRange(current, position.range.mode, upperPercent, lowerPercent);
-  const aquaRange = convertDisplayRangeToAquaRange(token0, token1, displayRange);
+  // 必须携带真实 ERC-20 decimals：Aqua 用原子余额计算价格，sqrt 区间保留 mixed-decimals pair 的窄区间精度。
+  const aquaRange = convertDisplayRangeToAquaSqrtRange(token0, state0.decimals, token1, state1.decimals, displayRange);
   const token0Config = position.pair.tokens[0];
   const token1Config = position.pair.tokens[1];
   const depositedToken = position.range.mode === "upper" ? token0Config : position.range.mode === "lower" ? token1Config : undefined;
@@ -246,7 +247,7 @@ async function addPosition(parameters: {
   logger.info(`仓位摘要：${position.range.mode === "upper" ? "上单边" : position.range.mode === "lower" ? "下单边" : "双边"}，${rangeDescription}，投入=${depositedToken ? `${depositedToken.symbol} ${depositedToken.balancePercent}` : `${token0Config.symbol} ${token0Config.balancePercent} + ${token1Config.symbol} ${token1Config.balancePercent}`}`);
   logger.info(`配置报价区间：1 ${token0Config.symbol} = ${formatFixed(displayRange.min)} 至 ${formatFixed(displayRange.max)} ${token1Config.symbol}；current=1 ${token0Config.symbol} = ${formatFixed(displayRange.current)} ${token1Config.symbol}`);
   logger.info(`反向报价区间：1 ${token1Config.symbol} = ${formatFixed(invertFixedPrice(displayRange.max))} 至 ${formatFixed(invertFixedPrice(displayRange.min))} ${token0Config.symbol}；current=1 ${token1Config.symbol} = ${formatFixed(invertFixedPrice(displayRange.current))} ${token0Config.symbol}`);
-  logger.info(`链上审计价格：Aqua 方向=tokenGt/tokenLt，displayOrderCanonical=${aquaRange.isDisplayOrderCanonical}，rawPriceMin=${aquaRange.rawPriceMin.toString()}，rawPriceMax=${aquaRange.rawPriceMax.toString()}`);
+  logger.info(`链上审计价格：Aqua 方向=tokenGt/tokenLt，displayOrderCanonical=${aquaRange.isDisplayOrderCanonical}，tokenLtDecimals=${aquaRange.isDisplayOrderCanonical ? state0.decimals : state1.decimals}，tokenGtDecimals=${aquaRange.isDisplayOrderCanonical ? state1.decimals : state0.decimals}，sqrtPriceMin=${aquaRange.sqrtPriceMin.toString()}，sqrtPriceMax=${aquaRange.sqrtPriceMax.toString()}`);
 
   const feePercent = parsePercentage(position.fee, "fee");
   const feeValue = percentageToAquaFeeValue(feePercent);
@@ -254,8 +255,8 @@ async function addPosition(parameters: {
   const built = buildConcentratedStrategy({
     chainId: parameters.chainId,
     maker: parameters.account.address,
-    rawPriceMin: aquaRange.rawPriceMin,
-    rawPriceMax: aquaRange.rawPriceMax,
+    sqrtPriceMin: aquaRange.sqrtPriceMin,
+    sqrtPriceMax: aquaRange.sqrtPriceMax,
     feeValue,
     amounts: [{ token: token0, amount: amount0 }, { token: token1, amount: amount1 }],
   });

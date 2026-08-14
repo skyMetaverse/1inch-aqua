@@ -4,6 +4,7 @@
  * 主要流程：使用公开地址和固定精确价格构建两次策略 -> 校验交易目标、hash 格式与策略唯一性。
  */
 import { expect, test } from "bun:test";
+import { parseConcentratedSqrtRange } from "../src/aqua/strategy-parser.ts";
 import { buildConcentratedStrategy } from "../src/aqua/strategy.ts";
 
 test("构建 0.001% Aqua 集中流动性 ship 策略", () => {
@@ -27,4 +28,24 @@ test("构建 0.001% Aqua 集中流动性 ship 策略", () => {
   expect(first.strategyHash).toMatch(/^0x[0-9a-f]{64}$/i);
   expect(first.strategyHash).not.toBe(second.strategyHash);
   expect(first.salt).not.toBe(second.salt);
+});
+
+test("sqrtPrice 参数可构建 mixed-decimals 集中流动性策略", () => {
+  const strategy = buildConcentratedStrategy({
+    chainId: 1,
+    maker: "0x01162202AC4A4C686FE95B946E4833b8869CF961",
+    sqrtPriceMin: 11_516_882_336n,
+    sqrtPriceMax: 11_520_338_956n,
+    feeValue: 10_000n,
+    amounts: [
+      { token: "0x111111111117dc0aa78b770fa6a738034120c302", amount: 1n },
+      { token: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", amount: 1n },
+    ],
+    salt: 1n,
+  });
+  expect(strategy.strategyHash).toMatch(/^0x[0-9a-f]{64}$/i);
+  expect(strategy.salt).toBe(1n);
+  const decoded = parseConcentratedSqrtRange(strategy.strategy);
+  expect(decoded.sqrtPriceMin).toBe(11_516_882_336n);
+  expect(decoded.sqrtPriceMax).toBe(11_520_338_956n);
 });

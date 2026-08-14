@@ -263,14 +263,22 @@ RPC_URL=https://your-rpc.example
 1 1INCH = N USDT
 ```
 
-Aqua SwapVM SDK 的集中流动性价格使用规范 token 排序下的 `P = tokenGt / tokenLt`。已通过当前安装的 SDK `ConcentrateGrowLiquidity2DArgs.fromRawPrices` 源码和官方 README 确认：`rawPriceMin`、`rawPriceMax` 直接是该人类价格比的 `1e18` 定点值，SDK 内部计算 `sqrt(P * 1e18)`；不应按两个 ERC20 的 `decimals` 再缩放。`decimals` 仅用于余额 raw amount 的读取和日志展示。
+Aqua SwapVM SDK 的集中流动性价格使用规范 token 排序下的 `P = tokenGt / tokenLt`，并在合约中以 ERC-20 **raw atomic balance** 运算。此前将人类价格直接作为 `rawPriceMin`、`rawPriceMax` 的说明是错误的：mixed-decimals pair 必须纳入 `decimalsGt - decimalsLt`，否则会产生 `10^N` 倍错误报价。
 
-因此必须有独立的价格方向转换模块：
+新实现不再把有损的 raw price 用作交易参数，而是精确构造 `sqrtPriceMin`、`sqrtPriceMax`。对于规范人类价格 `pHumanFixed`（1e18）有：
+
+```text
+sqrtPrice = floor(sqrt(pHumanFixed * 10^(decimalsGt - decimalsLt + 18)))
+```
+
+该推导与 SDK `Price.fromHuman()` 一致，保留了例如 `1INCH(18)/WBTC(8)` 的 5 bp 区间精度；将该价格先截断为 `rawPrice` 会把相邻窄区间压缩为同一个整数。`rawPrice` 仅保留作历史审计，不能用于 mixed-decimals 策略的创建、解析或再平衡判断。
+
+因此价格方向转换模块必须：
 
 1. 根据地址确定 Aqua 的 `tokenLt` 和 `tokenGt`。
-2. 将 EMSH current 返回的用户方向价格转换为 SDK 方向。
-3. 根据 SDK 方向计算 `rawPriceMin` 和 `rawPriceMax`。
-4. 将用户方向的上下边界和 SDK 方向的 raw 边界同时写入日志。
+2. 将 EMSH current 返回的用户方向价格转换为规范人类价格。
+3. 读取两个 ERC-20 的真实 `decimals`，计算精确 `sqrtPriceMin` 和 `sqrtPriceMax`。
+4. 将用户方向上下边界、两个 decimals 和 SDK sqrt 边界同时写入日志。
 
 任何反向转换都必须使用精确整数或定点有理数运算，不能先转成浮点数。
 
@@ -281,10 +289,10 @@ Aqua SwapVM SDK 的集中流动性价格使用规范 token 排序下的 `P = tok
 - current 价格作为十进制文本处理；超过 18 位时使用 bigint 向下量化，并记录舍弃的小数。
 - 余额百分比、费率和区间百分比作为十进制文本处理。
 - 使用 `bigint` 定点整数或精确有理数计算。
-- `decimals` 只作为链上返回的整数精度使用。
+- `decimals` 既用于余额格式化，也必须参与 Aqua concentrated sqrt 价格转换。
 - 余额百分比计算向下取整。
 - 价格乘除、上下浮动、倒数和方向转换均保留明确的舍入策略。
-- 最终传给 SDK 的 `rawPriceMin`、`rawPriceMax` 必须来自精确计算结果。
+- 最终传给 SDK 的 `sqrtPriceMin`、`sqrtPriceMax` 必须来自精确 decimals-aware 计算结果。
 - `parseUnits`、`formatUnits` 或仓库已有精确转换函数只能作为定点转换工具，不能把核心价格变成浮点数。
 - `Number` 只能用于不参与交易参数的普通展示，并且日志中的原始值必须同时保留字符串形式。
 
@@ -314,7 +322,7 @@ formatFixed(value, scale)
 9. 调用 EMSH current 接口。
 10. 记录价格原始返回关键字段、时间戳、本地接收时间和请求耗时。
 11. 计算用户可读区间。
-12. 转换为 Aqua SDK 价格方向和 raw price。
+12. 转换为 Aqua SDK 价格方向和 decimals-aware sqrt price。
 13. 在日志中输出完整交易预览。
 14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata；每次构建使用 SDK 支持的 `uint64` 加密随机 salt，避免相同参数与已关闭策略重用同一 hash。
 15. 查询两个代币对 Aqua registry 的 allowance。

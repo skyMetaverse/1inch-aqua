@@ -348,8 +348,8 @@ sourceCurrentBalanceUsd
 decisionReason
 targetMode
 targetAmountsRaw
-targetRawPriceMin
-targetRawPriceMax
+targetSqrtPriceMin
+targetSqrtPriceMax
 emshCurrentPriceText
 pairMarketSnapshot
 createdAt
@@ -361,6 +361,8 @@ shipTransactionHash?
 ```
 
 写入必须使用“写临时文件 -> fsync -> 原子 rename”流程，避免进程崩溃留下半个 JSON。状态文件权限必须限制为当前用户；不包含私钥、密码、Bearer token 或完整 RPC URL。
+
+状态格式为 v2，计划持久化的是 decimals-aware `targetSqrtPriceMin/Max`，而不是截断的 raw price。v1 状态文件可能包含 mixed-decimals 的错误报价，Bot 必须拒绝自动恢复；调用方应先人工核对链上状态并归档旧文件，不能把 v1 raw 参数迁移后直接广播。
 
 ### 7.2 已 dock、未 ship 的恢复
 
@@ -397,7 +399,7 @@ shipTransactionHash?
 
 ### 8.2 ship
 
-1. 从已持久化计划读取目标 token raw amount 和价格区间；不得重新根据链上余额改变计划。
+1. 从已持久化计划读取目标 token raw amount 和精确 sqrt 价格区间；不得重新根据链上余额改变计划。
 2. 查询钱包 ERC20 balance、decimals、allowance，确认计划金额可用。
 3. 对每个非零投入 token 使用已有通用授权流程：不足则非零 allowance 先清零，再尝试 `approve(MAX_UINT256)`，以回读 allowance 覆盖本次投入为成功条件。
 4. 使用现有 `buildConcentratedStrategy()`，每次生成随机 uint64 salt 与新 hash。

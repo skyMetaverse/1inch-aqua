@@ -11,10 +11,10 @@ import { createPublicClient, defineChain, http, isAddress, type Address, type Ch
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "../../scripts/encrypt-private-key.ts";
 import { buildConcentratedStrategy } from "../aqua/strategy.ts";
-import { parseConcentratedRawRange } from "../aqua/strategy-parser.ts";
+import { parseConcentratedSqrtRange } from "../aqua/strategy-parser.ts";
 import { validateRebalanceConfig, type RebalanceConfig } from "../config/rebalance-config.ts";
 import { readJsoncFile } from "../config/jsonc.ts";
-import { calculateDisplayRange, convertAquaRangeToDisplayRange, convertDisplayRangeToAquaRange, formatFixed, parseDecimal, parseDecimalFloor, parsePercentage, percentageToAquaFeeValue } from "../domain/fixed.ts";
+import { calculateDisplayRange, convertAquaSqrtRangeToDisplayRange, convertDisplayRangeToAquaSqrtRange, formatFixed, parseDecimal, parseDecimalFloor, parsePercentage, percentageToAquaFeeValue } from "../domain/fixed.ts";
 import { decideRebalance, outsideDistancePercent, relativePriceDeviationPercent, type RebalanceMode } from "../domain/rebalance.ts";
 import { getActiveStrategies, getPairMarkets, type ApiStrategy, type PairMarket } from "../infra/aqua-api.ts";
 import { readTokenState } from "../infra/erc20.ts";
@@ -155,9 +155,9 @@ async function executeDock(parameters: { plan: PersistedPlan; state: StateDocume
   plan = { ...plan, stage: "DOCK_VERIFIED", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`dock 已确认并复核：strategyHash=${plan.sourceStrategyHash}`); return plan;
 }
 
-/** 以持久化 salt 和 raw 参数构建新策略，确保恢复过程不会产生第二个 hash。 */
+/** 以持久化 salt 和精确 sqrt 参数构建新策略，确保恢复过程不会产生第二个 hash 或丢失 mixed-decimals 区间。 */
 function buildPlanStrategy(plan: PersistedPlan, chainId: number, maker: Address) {
-  const built = buildConcentratedStrategy({ chainId, maker, rawPriceMin: BigInt(plan.targetRawPriceMin), rawPriceMax: BigInt(plan.targetRawPriceMax), feeValue: percentageToAquaFeeValue(parsePercentage(plan.fee, "计划 fee")), amounts: [{ token: requireAddress(plan.tokens[0], "计划 token0"), amount: BigInt(plan.targetAmountsRaw[0]) }, { token: requireAddress(plan.tokens[1], "计划 token1"), amount: BigInt(plan.targetAmountsRaw[1]) }], salt: BigInt(plan.salt) });
+  const built = buildConcentratedStrategy({ chainId, maker, sqrtPriceMin: BigInt(plan.targetSqrtPriceMin), sqrtPriceMax: BigInt(plan.targetSqrtPriceMax), feeValue: percentageToAquaFeeValue(parsePercentage(plan.fee, "计划 fee")), amounts: [{ token: requireAddress(plan.tokens[0], "计划 token0"), amount: BigInt(plan.targetAmountsRaw[0]) }, { token: requireAddress(plan.tokens[1], "计划 token1"), amount: BigInt(plan.targetAmountsRaw[1]) }], salt: BigInt(plan.salt) });
   if (built.strategyHash.toLowerCase() !== plan.shipStrategyHash.toLowerCase()) throw new Error("持久化计划的 ship strategyHash 与重建结果不一致"); return built;
 }
 
@@ -188,9 +188,14 @@ async function executeShip(parameters: { plan: PersistedPlan; state: StateDocume
 
 /** 从一次 API/市场快照构造计划，计划中冻结 API raw 余额和随机 salt，后续不再修改策略参数。 */
 function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint, config: RebalanceConfig, account: Address, oldRange: { min: bigint; max: bigint }, reason: string): PersistedPlan {
-  const range = displayRangeForMode(current, mode, config); const aquaRange = convertDisplayRangeToAquaRange(strategy.tokens[0].address, strategy.tokens[1].address, range); const amounts = planAmounts(strategy, mode); const salt = BigInt(`0x${randomBytes(8).toString("hex")}`);
-  const built = buildConcentratedStrategy({ chainId: strategy.chainId, maker: account, rawPriceMin: aquaRange.rawPriceMin, rawPriceMax: aquaRange.rawPriceMax, feeValue: percentageToAquaFeeValue(parsePercentage(config.rebalance.fee, "rebalance.fee")), amounts: [{ token: strategy.tokens[0].address, amount: amounts[0] }, { token: strategy.tokens[1].address, amount: amounts[1] }], salt });
-  const now = Date.now(); return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetAmountsRaw: [amounts[0].toString(), amounts[1].toString()], targetRawPriceMin: aquaRange.rawPriceMin.toString(), targetRawPriceMax: aquaRange.rawPriceMax.toString(), fee: config.rebalance.fee, salt: salt.toString(), shipStrategyHash: built.strategyHash, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED" };
+  const range = displayRangeForMode(current, mode, config);
+  // API 的 decimals 是策略元数据的一部分；缺失或漂移已在 API 适配层拒绝，不能退化为 rawPrice 重挂。
+  const aquaRange = convertDisplayRangeToAquaSqrtRange(strategy.tokens[0].address, strategy.tokens[0].decimals, strategy.tokens[1].address, strategy.tokens[1].decimals, range);
+  const amounts = planAmounts(strategy, mode);
+  const salt = BigInt(`0x${randomBytes(8).toString("hex")}`);
+  const built = buildConcentratedStrategy({ chainId: strategy.chainId, maker: account, sqrtPriceMin: aquaRange.sqrtPriceMin, sqrtPriceMax: aquaRange.sqrtPriceMax, feeValue: percentageToAquaFeeValue(parsePercentage(config.rebalance.fee, "rebalance.fee")), amounts: [{ token: strategy.tokens[0].address, amount: amounts[0] }, { token: strategy.tokens[1].address, amount: amounts[1] }], salt });
+  const now = Date.now();
+  return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetAmountsRaw: [amounts[0].toString(), amounts[1].toString()], targetSqrtPriceMin: aquaRange.sqrtPriceMin.toString(), targetSqrtPriceMax: aquaRange.sqrtPriceMax.toString(), fee: config.rebalance.fee, salt: salt.toString(), shipStrategyHash: built.strategyHash, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED" };
 }
 
 /** 每轮处理 API 返回的完整仓位集合；每个 strategyHash 都是独立仓位，同 pair 不再互相跳过。 */
@@ -216,7 +221,10 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
       const currentResponse = await getCurrentPrice(strategy.tokens[0].address, strategy.tokens[1].address, strategy.chainId); currentTimestampValid(currentResponse.timestamp, parameters.config.polling.maxCurrentPriceAgeSeconds); const currentResult = parseDecimalFloor(currentResponse.priceText, 18, "EMSH current"); const current = currentResult.value; if (currentResult.truncated) parameters.logger.info(`EMSH current 精度处理：strategyHash=${strategy.strategyHash}，价格超过 18 位，向下取整；舍弃小数=${currentResult.discardedFraction}`);
       const pairPrice = parseDecimal(String(market.lastPrice), 18, "Pair lastPrice"); const priceDeviation = relativePriceDeviationPercent(current, pairPrice); const maxDeviation = parsePercentage(parameters.config.market.maxPairPriceDeviationPercent, "maxPairPriceDeviationPercent"); const volumeMinimum = Number(parameters.config.market.minimumPairVolumeUsd);
       const marketHealthy = Number.isFinite(volumeMinimum) && market.volumeUsd >= volumeMinimum && market.swaps >= parameters.config.market.minimumPairSwaps && priceDeviation <= maxDeviation;
-      const rawRange = parseConcentratedRawRange(strategy.strategyBytes); const display = convertAquaRangeToDisplayRange(strategy.tokens[0].address, strategy.tokens[1].address, rawRange); const oldRange = { ...display, current };
+      // 直接解析 sqrt 区间并按 API token decimals 恢复人类价格；先截断 rawPrice 会把 8/18 decimals 的窄区间压成同一个整数。
+      const sqrtRange = parseConcentratedSqrtRange(strategy.strategyBytes);
+      const display = convertAquaSqrtRangeToDisplayRange(strategy.tokens[0].address, strategy.tokens[0].decimals, strategy.tokens[1].address, strategy.tokens[1].decimals, sqrtRange);
+      const oldRange = { ...display, current };
       const outside = outsideDistancePercent(current, oldRange); const excess = parsePercentage(parameters.config.rebalance.recenterExcess, "recenterExcess"); const observation = parameters.state.observations[key]; const prior = observation?.strategyHash === strategy.strategyHash ? observation : { strategyHash: strategy.strategyHash, breachCount: 0, lastShipAt: observation?.lastShipAt }; const breachCount = outside > excess ? prior.breachCount + 1 : 0; parameters.state.observations[key] = { ...prior, breachCount }; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
       const cooldownElapsed = !prior.lastShipAt || Date.now() - prior.lastShipAt >= parameters.config.rebalance.cooldownSeconds * 1000;
       const decision = decideRebalance({ balances: { initial: [strategy.tokens[0].initialBalance.raw, strategy.tokens[1].initialBalance.raw], current: [strategy.tokens[0].currentBalance.raw, strategy.tokens[1].currentBalance.raw], usd: [strategy.tokens[0].currentBalance.usd, strategy.tokens[1].currentBalance.usd] }, currentPrice: current, oldRange, marketHealthy, stableBreach: breachCount >= parameters.config.polling.stableSnapshotsRequired, cooldownElapsed, recenterExcessPercent: excess, minValueRatioBps: parameters.config.rebalance.convertToTwoSidedMinValueRatioBps });

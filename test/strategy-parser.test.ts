@@ -4,9 +4,15 @@
  * 主要流程：解析历史策略字节 -> 读取 raw 区间 -> 断言区间有效且落在创建记录附近。
  */
 import { expect, test } from "bun:test";
-import { parseConcentratedRawRange } from "../src/aqua/strategy-parser.ts";
+import { parseConcentratedRawRange, parseConcentratedSqrtRange } from "../src/aqua/strategy-parser.ts";
 
 const strategyBytes = "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000001162202ac4a4c686fe95b946e4833b8869cf9614000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000541240000000000000000000000000000000000000000000000000021d2d0e9552c32c000000000000000000000000000000000000000000000000021d33fc0ab59e2a15040000271011001408dc12d9fa8e93b89d000000000000000000000000" as const;
+
+test("解析真实集中流动性 strategyBytes 的精确 sqrt 价格范围", () => {
+  const range = parseConcentratedSqrtRange(strategyBytes);
+  expect(range.sqrtPriceMin).toBe(152327503058486060n);
+  expect(range.sqrtPriceMax).toBe(152335120004914730n);
+});
 
 test("解析真实集中流动性 strategyBytes 的 raw 价格范围", () => {
   const range = parseConcentratedRawRange(strategyBytes);

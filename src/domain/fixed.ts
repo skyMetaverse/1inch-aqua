@@ -24,6 +24,13 @@ export interface AquaPriceRange {
   isDisplayOrderCanonical: boolean;
 }
 
+/** Aqua 集中流动性指令使用的精确 sqrt 价格；避免 mixed-decimals pair 在 rawPrice 整数层丢失区间精度。 */
+export interface AquaSqrtPriceRange {
+  sqrtPriceMin: bigint;
+  sqrtPriceMax: bigint;
+  isDisplayOrderCanonical: boolean;
+}
+
 function parseDecimalParts(text: string, fieldName: string): { integerText: string; fractionText: string } {
   const normalized = text.trim();
   const match = normalized.match(/^(?:0|[1-9]\d*)(?:\.(\d+))?$/);
@@ -169,6 +176,90 @@ export function convertDisplayRangeToAquaRange(
     throw new Error("反向转换后的 Aqua 价格区间无效");
   }
   return { rawPriceMin, rawPriceMax, isDisplayOrderCanonical: false };
+}
+
+/** 使用整数 Newton 迭代计算 floor(sqrt(value))，整个价格路径不经过 Number。 */
+function integerSqrt(value: bigint): bigint {
+  if (value < 0n) throw new Error("sqrt 输入不能为负数");
+  if (value < 2n) return value;
+  let current = value;
+  let next = (current + 1n) >> 1n;
+  while (next < current) {
+    current = next;
+    next = (current + value / current) >> 1n;
+  }
+  return current;
+}
+
+/** 将 decimals 差异折入 sqrtPrice 的被开方数；负指数时先向下量化，绝不把不可表示精度伪装为有效价格。 */
+function sqrtPriceFromCanonicalHumanPrice(price: bigint, tokenLtDecimals: number, tokenGtDecimals: number): bigint {
+  if (price <= 0n) throw new Error("规范人类价格必须大于零");
+  if (!Number.isSafeInteger(tokenLtDecimals) || !Number.isSafeInteger(tokenGtDecimals) || tokenLtDecimals < 0 || tokenGtDecimals < 0 || tokenLtDecimals > 255 || tokenGtDecimals > 255) {
+    throw new Error("token decimals 必须是 0 到 255 的安全整数");
+  }
+  // sqrtPrice^2 = humanPrice(1e18) * 10^(gtDecimals - ltDecimals + 18)。
+  // 这等价于 SDK Price.fromHuman 的 decimal-normalized 推导，直接保留 sqrt 层精度。
+  const exponent = tokenGtDecimals - tokenLtDecimals + 18;
+  const radicand = exponent >= 0 ? price * 10n ** BigInt(exponent) : price / (10n ** BigInt(-exponent));
+  if (radicand <= 0n) throw new Error("token decimals 差异导致价格无法以 Aqua sqrt 精度表达");
+  const sqrtPrice = integerSqrt(radicand);
+  if (sqrtPrice <= 0n) throw new Error("Aqua sqrt 价格必须大于零");
+  return sqrtPrice;
+}
+
+/**
+ * 将人类展示区间转换为 Aqua 精确 sqrt 区间。
+ * SwapVM 使用原子单位余额计算 P；先处理规范地址方向，再将 token decimals 纳入 sqrt 价格，避免 rawPrice 的 1e18 整数截断使窄区间塌缩。
+ */
+export function convertDisplayRangeToAquaSqrtRange(
+  displayToken0: string,
+  displayToken0Decimals: number,
+  displayToken1: string,
+  displayToken1Decimals: number,
+  displayRange: DisplayPriceRange,
+): AquaSqrtPriceRange {
+  const canonicalRange = convertDisplayRangeToAquaRange(displayToken0, displayToken1, displayRange);
+  const tokenLtDecimals = canonicalRange.isDisplayOrderCanonical ? displayToken0Decimals : displayToken1Decimals;
+  const tokenGtDecimals = canonicalRange.isDisplayOrderCanonical ? displayToken1Decimals : displayToken0Decimals;
+  const sqrtPriceMin = sqrtPriceFromCanonicalHumanPrice(canonicalRange.rawPriceMin, tokenLtDecimals, tokenGtDecimals);
+  const sqrtPriceMax = sqrtPriceFromCanonicalHumanPrice(canonicalRange.rawPriceMax, tokenLtDecimals, tokenGtDecimals);
+  if (sqrtPriceMin <= 0n || sqrtPriceMin >= sqrtPriceMax) throw new Error("Aqua sqrt 价格区间无效；当前精度下无法表示该窄区间");
+  return { sqrtPriceMin, sqrtPriceMax, isDisplayOrderCanonical: canonicalRange.isDisplayOrderCanonical };
+}
+
+/**
+ * 将 Aqua sqrt 区间按原 token 顺序恢复为 1e18 人类展示价格。
+ * 必须从 sqrt 值直接恢复，不能先截断成 rawPrice；mixed-decimals pair 的 rawPrice 可能相同而 sqrt 区间仍然不同。
+ */
+export function convertAquaSqrtRangeToDisplayRange(
+  displayToken0: string,
+  displayToken0Decimals: number,
+  displayToken1: string,
+  displayToken1Decimals: number,
+  aquaRange: { sqrtPriceMin: bigint; sqrtPriceMax: bigint },
+): Pick<DisplayPriceRange, "min" | "max"> {
+  if (aquaRange.sqrtPriceMin <= 0n || aquaRange.sqrtPriceMin >= aquaRange.sqrtPriceMax) throw new Error("Aqua sqrt 价格区间无效");
+  const canonical = displayToken0.toLowerCase() < displayToken1.toLowerCase();
+  const tokenLtDecimals = canonical ? displayToken0Decimals : displayToken1Decimals;
+  const tokenGtDecimals = canonical ? displayToken1Decimals : displayToken0Decimals;
+  if (!Number.isSafeInteger(tokenLtDecimals) || !Number.isSafeInteger(tokenGtDecimals) || tokenLtDecimals < 0 || tokenGtDecimals < 0 || tokenLtDecimals > 255 || tokenGtDecimals > 255) {
+    throw new Error("token decimals 必须是 0 到 255 的安全整数");
+  }
+  const exponent = tokenGtDecimals - tokenLtDecimals + 18;
+  const toCanonicalHumanPrice = (sqrtPrice: bigint): bigint => {
+    const squared = sqrtPrice * sqrtPrice;
+    const value = exponent >= 0 ? squared / (10n ** BigInt(exponent)) : squared * (10n ** BigInt(-exponent));
+    if (value <= 0n) throw new Error("Aqua sqrt 价格恢复后必须大于零");
+    return value;
+  };
+  const canonicalMin = toCanonicalHumanPrice(aquaRange.sqrtPriceMin);
+  const canonicalMax = toCanonicalHumanPrice(aquaRange.sqrtPriceMax);
+  if (canonicalMin <= 0n || canonicalMin >= canonicalMax) throw new Error("Aqua sqrt 价格恢复后的规范区间无效");
+  if (canonical) return { min: canonicalMin, max: canonicalMax };
+  const min = invertFixedPrice(canonicalMax);
+  const max = invertFixedPrice(canonicalMin);
+  if (min <= 0n || min >= max) throw new Error("Aqua sqrt 反向展示价格区间无效");
+  return { min, max };
 }
 
 /**

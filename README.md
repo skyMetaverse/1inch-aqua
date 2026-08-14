@@ -49,7 +49,7 @@ try {
 
 添加 LP 使用带中文注释的 JSONC 文件。复制 [lp.add.example.jsonc](/Users/syskey/git/1inch-aqua/config/lp.add.example.jsonc) 为 `config/lp.add.jsonc`，填写 ERC20 地址、余额百分比、页面显示费率和单双边范围；完整字段规则见 [config/README.md](/Users/syskey/git/1inch-aqua/config/README.md)。
 
-添加脚本只使用 EMSH `current` 实时价格，以配置 token 顺序作为显示价格方向。价格、百分比、费率和区间全程使用 `bigint` 定点运算，核心交易计算不使用 JavaScript 浮点数。EMSH 超过 Aqua 的 18 位价格精度时会在边界向下量化并记录舍弃小数；配置百分比和费率等输入仍严格拒绝超精度。交易使用本地解密私钥签名，通过 RPC 的 `eth_sendRawTransaction` 广播。
+添加脚本只使用 EMSH `current` 实时价格，以配置 token 顺序作为显示价格方向。价格、百分比、费率和区间全程使用 `bigint` 定点运算，核心交易计算不使用 JavaScript 浮点数。脚本会读取两个 ERC-20 的真实 `decimals`，以 decimals-aware `sqrtPrice` 编码 Aqua 区间；这对 1INCH/WBTC、1INCH/cbBTC、1INCH/USDT 等不同精度代币对是交易安全边界。EMSH 超过 Aqua 的 18 位价格精度时会在边界向下量化并记录舍弃小数；配置百分比和费率等输入仍严格拒绝超精度。交易使用本地解密私钥签名，通过 RPC 的 `eth_sendRawTransaction` 广播。
 
 先执行 dry-run。它会读取实际余额、allowance、current 价格，计算区间并模拟 approve/ship，但不广播交易：
 
@@ -117,7 +117,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 active strategyHash 会分别监控、分别决策、分别保存状态。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 active strategyHash 会分别监控、分别决策、分别保存状态。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，不能在未人工审计的情况下恢复自动交易。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
 
 运行回归测试：
 
