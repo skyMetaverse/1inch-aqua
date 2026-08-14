@@ -113,7 +113,7 @@ bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 confi
 
 ## 自动再平衡 Bot
 
-Bot 监控 1inch 官方策略 API 返回的当前 maker 全部受支持 active concentrated 仓位，以策略 API 的 `currentBalance` 判断当前资产状态，以 Pair API 判断市场活跃度，以 EMSH current 计算新的 5 bp 区间。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足连续越界、冷却期、市场活跃度和价格交叉校验条件时自动执行 `dock -> ship`。
+Bot 监控 1inch 官方策略 API 返回的当前 maker 全部受支持 active concentrated 仓位，以策略 API 的 `currentBalance` 判断当前资产状态，以 EMSH current 计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据；自动重挂仍要求 Pair 最少 swaps 和 Pair/EMSH 价格交叉校验。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足连续越界、冷却期和上述价格安全条件时自动执行 `dock -> ship`。
 
 先创建本地运行配置：
 

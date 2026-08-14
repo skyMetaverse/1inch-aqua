@@ -60,7 +60,8 @@ export function decideRebalance(input: {
   if (!sourceMode) return { action: "block", reason: "策略初始两侧余额均为零，无法识别源模式" };
   if (input.balances.current.some((value) => value < 0n)) return { action: "block", reason: "策略当前 raw 余额不能为负数" };
   if (input.balances.current[0] === 0n && input.balances.current[1] === 0n) return { action: "block", reason: "策略当前两侧余额均为零" };
-  if (!input.marketHealthy) return { action: "keep", reason: "市场活跃度或价格交叉校验未通过，保持当前策略" };
+  // 成交量不再作为门槛；此处只在 Pair 最少 swaps 或 Pair/EMSH 交叉校验失败时阻止自动交易。
+  if (!input.marketHealthy) return { action: "keep", reason: "Pair swaps 或价格交叉校验未通过，保持当前策略" };
   if (!input.cooldownElapsed) return { action: "keep", reason: "仍处于重挂冷却期" };
 
   const bothCurrent = hasBothCurrentBalances(input.balances.current);

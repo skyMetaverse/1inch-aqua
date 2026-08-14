@@ -49,7 +49,7 @@ export function parseApiStrategy(value: unknown): ApiStrategy {
   return { chainId: integer(item.chainId, "策略 chainId"), maker: address(item.maker, "策略 maker"), app: address(item.app, "策略 app"), strategyHash: hash(item.strategyHash, "策略 strategyHash"), strategyBytes: hex(item.strategyBytes, "策略 strategyBytes"), openedAt: integer(item.openedAt, "策略 openedAt"), tokens, classification: { type, state, feePercent: finite(classification.feePercent, "策略 classification.feePercent") }, performance: { volumeUsd: finite(totalVolume.usd, "策略 performance.volume.total.usd"), feesUsd: finite(totalFees.usd, "策略 performance.fees.total.usd") } };
 }
 
-/** 严格解析 Pair API 响应；该价格仅用于市场活跃度与交叉校验。 */
+/** 严格解析 Pair API 响应；lastPrice 用于价格交叉校验，volumeUsd 仅作日志观察。 */
 export function parsePairMarket(value: unknown): PairMarket {
   const item = record(value, "Pair 市场项");
   return { token0: address(item.token0, "Pair token0"), token1: address(item.token1, "Pair token1"), lastPrice: finite(item.lastPrice, "Pair lastPrice", false), volumeUsd: finite(item.volumeUsd, "Pair volumeUsd"), swaps: integer(item.swaps, "Pair swaps"), diffPercent1h: signedFinite(item.diffPercent1h, "Pair diffPercent1h"), diffPercent24h: signedFinite(item.diffPercent24h, "Pair diffPercent24h"), diffPercent7d: signedFinite(item.diffPercent7d, "Pair diffPercent7d") };

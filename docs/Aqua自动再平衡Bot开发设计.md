@@ -208,9 +208,8 @@ config/rebalance.jsonc
   },
 
   "market": {
-    // 当前范围以 EMSH current 为准；Pair API 仅作活跃度和偏差保护。
+    // 当前范围以 EMSH current 为准；Pair API 用于最少 swaps 与价格交叉保护。
     "maxPairPriceDeviationPercent": "1%",
-    "minimumPairVolumeUsd": "1000",
     "minimumPairSwaps": 1
   },
 
@@ -232,7 +231,7 @@ config/rebalance.jsonc
 字段说明：
 
 - `fee`：新建仓位的固定 Aqua taker fee；不信任 API `feePercent: number` 直接作为交易参数。
-- `minimumPairVolumeUsd` 和 `minimumPairSwaps`：Pair API 低于任一阈值时不自动重挂，只记录原因。USD JSON number 仅用于与配置阈值的运营判断，不参与 token raw amount 或价格区间计算。
+- `minimumPairSwaps`：Pair API 的 swaps 低于该阈值时不自动重挂。Pair `volumeUsd` 因统计窗口和小额 pair 聚合口径不稳定，仅记录到日志，不参与自动交易门槛。
 - `maxPairPriceDeviationPercent`：EMSH current 与 Pair `lastPrice` 偏离超过阈值时停止自动交易，记录两源价格冲突。实测 `1INCH/UNI` 的两者可正常相差约 `0.30%`，因为接口语义不同；默认使用 `1%` 作为异常熔断，而不是误用 5 bp 要求两者一致。
 - `convertToTwoSidedMinValueRatioBps=8000`：小侧 USD 至少为大侧 USD 的 80% 时视为接近等值。
 - `stateFile`：持久化状态，仅用于幂等恢复与计划生命周期，绝不替代 API 形成业务决策。
@@ -302,17 +301,17 @@ current 两侧均为 0：阻止自动处理
 
 若一侧 raw 为零，按 6.1 自动降级为对应单边逻辑。
 
-### 6.4 价格与活跃度门槛
+### 6.4 价格与 swaps 门槛
 
 一次自动重挂同时必须满足：
 
 1. EMSH current 时间戳在配置最大年龄内，价格为正且可解析为 1e18 bigint；超过 18 位时必须先向下量化且量化结果仍大于零。
 2. Pair API 的 `lastPrice` 正、有限，且与 EMSH current 的偏离不超过配置阈值。
-3. Pair API 的 `volumeUsd >= minimumPairVolumeUsd` 且 `swaps >= minimumPairSwaps`。
+3. Pair API 的 `swaps >= minimumPairSwaps`；`volumeUsd` 仅记录为观察数据，不作为自动交易门槛。
 4. 当前策略 API 快照结构完整且支持。
 5. 计划不在冷却期，并满足价格越界确认。
 
-任一条件不满足：保持当前策略，不广播交易，记录详细中文原因。Pair API 市场活跃不代表 Aqua 一定成交；它仅避免在没有自然需求的 pair 上频繁重挂。
+任一条件不满足：保持当前策略，不广播交易，记录详细中文原因。Pair API 的 swaps 不能证明 Aqua 一定成交；它仅作为最低市场活动信号，价格安全仍以 Pair/EMSH 交叉校验为准。
 
 ## 7. 自动执行状态机与恢复
 

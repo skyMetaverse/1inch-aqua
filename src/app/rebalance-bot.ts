@@ -219,8 +219,9 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
     const market = markets.get(marketKey(strategy.tokens)); if (!market) throw new Error(`缺少 strategyHash=${strategy.strategyHash} 的 Pair 市场数据`);
     try {
       const currentResponse = await getCurrentPrice(strategy.tokens[0].address, strategy.tokens[1].address, strategy.chainId); currentTimestampValid(currentResponse.timestamp, parameters.config.polling.maxCurrentPriceAgeSeconds); const currentResult = parseDecimalFloor(currentResponse.priceText, 18, "EMSH current"); const current = currentResult.value; if (currentResult.truncated) parameters.logger.info(`EMSH current 精度处理：strategyHash=${strategy.strategyHash}，价格超过 18 位，向下取整；舍弃小数=${currentResult.discardedFraction}`);
-      const pairPrice = parseDecimal(String(market.lastPrice), 18, "Pair lastPrice"); const priceDeviation = relativePriceDeviationPercent(current, pairPrice); const maxDeviation = parsePercentage(parameters.config.market.maxPairPriceDeviationPercent, "maxPairPriceDeviationPercent"); const volumeMinimum = Number(parameters.config.market.minimumPairVolumeUsd);
-      const marketHealthy = Number.isFinite(volumeMinimum) && market.volumeUsd >= volumeMinimum && market.swaps >= parameters.config.market.minimumPairSwaps && priceDeviation <= maxDeviation;
+      const pairPrice = parseDecimal(String(market.lastPrice), 18, "Pair lastPrice"); const priceDeviation = relativePriceDeviationPercent(current, pairPrice); const maxDeviation = parsePercentage(parameters.config.market.maxPairPriceDeviationPercent, "maxPairPriceDeviationPercent");
+      // Pair volumeUsd 的统计窗口和小额 pair 的聚合口径不稳定，仅作为日志观察；自动交易仍要求最少 swaps 与独立价格源交叉通过。
+      const marketHealthy = market.swaps >= parameters.config.market.minimumPairSwaps && priceDeviation <= maxDeviation;
       // 直接解析 sqrt 区间并按 API token decimals 恢复人类价格；先截断 rawPrice 会把 8/18 decimals 的窄区间压成同一个整数。
       const sqrtRange = parseConcentratedSqrtRange(strategy.strategyBytes);
       const display = convertAquaSqrtRangeToDisplayRange(strategy.tokens[0].address, strategy.tokens[0].decimals, strategy.tokens[1].address, strategy.tokens[1].decimals, sqrtRange);

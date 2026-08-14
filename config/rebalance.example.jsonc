@@ -9,7 +9,6 @@
   "market": {
     // Pair lastPrice 与 EMSH current 超过该偏离时停止自动交易；二者语义不同，不能用 5 bp。
     "maxPairPriceDeviationPercent": "1%",
-    "minimumPairVolumeUsd": "1000",
     "minimumPairSwaps": 1
   },
   "rebalance": {
