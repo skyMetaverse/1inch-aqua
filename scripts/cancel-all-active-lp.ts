@@ -1,7 +1,7 @@
 /**
- * Aqua 活跃 LP 一键取消脚本：通过 1inch Aqua 仓位查询接口发现当前 maker 的 open 仓位，并逐个发送 dock 交易。
+ * Aqua 活跃 LP 一键取消脚本：通过 1inch Aqua 仓位查询接口发现当前 maker 的 open 仓位，并按数量选择 atomic multicall 或串行 dock。
  * 核心功能：复用加密私钥、校验 API 与链上策略状态、模拟 dock、广播交易并验证 Docked 事件和 docked 状态。
- * 主要流程：解密私钥 -> 查询 open 仓位 -> 链上预检 -> 串行 dock -> 等待回执 -> 记录中文运行日志。
+ * 主要流程：解密私钥 -> 查询 open 仓位 -> 链上预检与模拟 -> 超过两个时 atomic multicall dock，否则串行 dock -> 回执与状态复核。
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
@@ -27,6 +27,7 @@ import {
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "./encrypt-private-key.ts";
+import { buildAquaMulticallTransaction } from "../src/aqua/multicall.ts";
 import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
 
 const ENV_FILE = ".env";
@@ -53,6 +54,14 @@ interface MakerStrategy {
 /** Aqua 页面 strategies/makers 接口响应。 */
 interface MakerStrategiesResponse {
   items: MakerStrategy[];
+}
+
+/** 已完成链上预检和单笔模拟的 dock 子调用；批量模式只允许组装这些确定参数。 */
+interface PreparedDock {
+  app: ViemAddress;
+  strategyHash: Hex;
+  tokens: ViemAddress[];
+  dock: { to: ViemAddress; data: Hex; value: bigint };
 }
 
 /** 统一中文日志，同时写入终端和本次运行的独立文件。 */
@@ -350,6 +359,33 @@ async function verifyDockedRawBalances(
 }
 
 /**
+ * 准备一个 dock 子调用。批量与串行路径共用链上预检和单笔模拟，避免只模拟 batch 时遗漏单策略 API/状态异常。
+ */
+async function prepareDock(
+  strategy: MakerStrategy,
+  publicClient: ReturnType<typeof createPublicClient>,
+  registry: ViemAddress,
+  maker: ViemAddress,
+  chainId: number,
+  logger: Logger,
+): Promise<PreparedDock> {
+  const { app, strategyHash, tokens } = validateStrategy(strategy, maker, chainId);
+  logger.info(`开始处理仓位 strategyHash=${strategyHash}，app=${app}，代币数=${tokens.length}`);
+  await verifyActiveRawBalances(publicClient, registry, maker, app, strategyHash, tokens, logger);
+  const aqua = new AquaProtocolContract(new Address(registry));
+  const dockTx = aqua.dock({
+    app: new Address(app),
+    strategyHash: new HexString(strategyHash),
+    tokens: tokens.map((token) => new Address(token)),
+  });
+  const dock = { to: dockTx.to.toString() as ViemAddress, data: dockTx.data.toString() as Hex, value: dockTx.value };
+  logger.info(`dock 交易已构建：to=${dock.to}，data 字节数=${(dock.data.length - 2) / 2}，value=${dock.value.toString()}`);
+  await publicClient.call({ account: maker, to: dock.to, data: dock.data, value: dock.value });
+  logger.info(`dock 链上模拟成功：strategyHash=${strategyHash}`);
+  return { app, strategyHash, tokens, dock };
+}
+
+/**
  * 逐个关闭策略，串行执行避免连续 wallet 交易产生 nonce 竞争。
  * dry-run 仍执行完整的 API、链上预检和 eth_call 模拟，但绝不广播交易。
  */
@@ -365,57 +401,86 @@ async function cancelStrategy(
   logger: Logger,
 ): Promise<void> {
   const maker = account.address;
-  const { app, strategyHash, tokens } = validateStrategy(strategy, maker, chainId);
-  logger.info(`开始处理仓位 strategyHash=${strategyHash}，app=${app}，代币数=${tokens.length}`);
-  await verifyActiveRawBalances(publicClient, registry, maker, app, strategyHash, tokens, logger);
-
-  const aqua = new AquaProtocolContract(new Address(registry));
-  const dockTx = aqua.dock({
-    app: new Address(app),
-    strategyHash: new HexString(strategyHash),
-    tokens: tokens.map((token) => new Address(token)),
-  });
-  const to = dockTx.to.toString() as ViemAddress;
-  const data = dockTx.data.toString() as Hex;
-  logger.info(`dock 交易已构建：to=${to}，data 字节数=${(data.length - 2) / 2}，value=${dockTx.value.toString()}`);
-
-  // 先模拟再发送，确保 API 返回与当前链上状态之间未发生会导致 dock 回滚的变化。
-  await publicClient.call({ account: maker, to, data, value: dockTx.value });
-  logger.info(`dock 链上模拟成功：strategyHash=${strategyHash}`);
+  const prepared = await prepareDock(strategy, publicClient, registry, maker, chainId, logger);
 
   if (dryRun) {
-    logger.info(`dry-run 模式：未广播 dock 交易，strategyHash=${strategyHash}`);
+    logger.info(`dry-run 模式：未广播 dock 交易，strategyHash=${prepared.strategyHash}`);
     return;
   }
 
   let transactionHash: Hex;
   try {
-    transactionHash = await sendLocallySignedTransaction(account, chain, http(rpcUrl), {
-      to,
-      data,
-      value: dockTx.value,
-    });
+    transactionHash = await sendLocallySignedTransaction(account, chain, http(rpcUrl), prepared.dock);
   } catch (error) {
     // viem 的完整错误可能包含 RPC URL 和 calldata；日志只保留首行可复盘原因，避免扩散敏感 RPC 信息。
     const reason = error instanceof Error ? error.message.split("\n")[0]?.trim() : "未知 RPC 错误";
     throw new Error(`dock 本地签名广播失败：${reason || "未知 RPC 错误"}`);
   }
-  logger.info(`dock 交易已广播：strategyHash=${strategyHash}，交易哈希=${transactionHash}`);
+  logger.info(`dock 交易已广播：strategyHash=${prepared.strategyHash}，交易哈希=${transactionHash}`);
   const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 });
-  logger.info(`dock 交易已确认：strategyHash=${strategyHash}，状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
+  logger.info(`dock 交易已确认：strategyHash=${prepared.strategyHash}，状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
   if (receipt.status !== "success") {
     throw new Error(`dock 交易回执失败：${transactionHash}`);
   }
 
-  verifyDockedEvent(receipt.logs as unknown as ReadonlyArray<{ address: ViemAddress; data: Hex; topics: readonly Hex[] }>, registry, maker, app, strategyHash);
-  logger.info(`Docked 事件校验成功：strategyHash=${strategyHash}`);
-  await verifyDockedRawBalances(publicClient, registry, maker, app, strategyHash, tokens, logger);
-  logger.info(`仓位关闭完成：strategyHash=${strategyHash}`);
+  verifyDockedEvent(receipt.logs as unknown as ReadonlyArray<{ address: ViemAddress; data: Hex; topics: readonly Hex[] }>, registry, maker, prepared.app, prepared.strategyHash);
+  logger.info(`Docked 事件校验成功：strategyHash=${prepared.strategyHash}`);
+  await verifyDockedRawBalances(publicClient, registry, maker, prepared.app, prepared.strategyHash, prepared.tokens, logger);
+  logger.info(`仓位关闭完成：strategyHash=${prepared.strategyHash}`);
 }
 
 /**
- * 脚本入口：查询当前 maker 全部 open 仓位并串行 dock。
- * 任一仓位失败后立即停止，防止出现未记录清楚的部分关闭状态。
+ * 原子关闭多个策略。所有子调用先独立预检和模拟，再模拟完整 multicall；任一失败均不会发送整批交易。
+ * 这与串行模式的部分成功语义不同：multicall 广播成功时所有 dock 同时落链，失败时整批回滚。
+ */
+async function cancelStrategiesWithMulticall(parameters: {
+  strategies: readonly MakerStrategy[];
+  publicClient: ReturnType<typeof createPublicClient>;
+  registry: ViemAddress;
+  account: PrivateKeyAccount;
+  chainId: number;
+  chain: Chain;
+  rpcUrl: string;
+  dryRun: boolean;
+  logger: Logger;
+}): Promise<void> {
+  const prepared: PreparedDock[] = [];
+  for (const [index, strategy] of parameters.strategies.entries()) {
+    parameters.logger.info(`处理第 ${index + 1}/${parameters.strategies.length} 个活跃仓位（multicall 预检）`);
+    prepared.push(await prepareDock(strategy, parameters.publicClient, parameters.registry, parameters.account.address, parameters.chainId, parameters.logger));
+  }
+  const multicall = buildAquaMulticallTransaction(parameters.registry, prepared.map((item) => item.dock));
+  await parameters.publicClient.call({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
+  parameters.logger.info(`批量 multicall dock 链上模拟成功：子调用数=${prepared.length}，data 字节数=${(multicall.data.length - 2) / 2}`);
+  if (parameters.dryRun) {
+    parameters.logger.info(`dry-run 模式：未广播 multicall dock，子调用数=${prepared.length}`);
+    return;
+  }
+
+  let transactionHash: Hex;
+  try {
+    transactionHash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), multicall);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message.split("\n")[0]?.trim() : "未知 RPC 错误";
+    throw new Error(`multicall dock 本地签名广播失败：${reason || "未知 RPC 错误"}`);
+  }
+  parameters.logger.info(`批量 multicall dock 已广播：子调用数=${prepared.length}，交易哈希=${transactionHash}`);
+  const receipt = await parameters.publicClient.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 });
+  parameters.logger.info(`批量 multicall dock 已确认：状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
+  if (receipt.status !== "success") throw new Error(`multicall dock 回执失败：${transactionHash}`);
+
+  const logs = receipt.logs as unknown as ReadonlyArray<{ address: ViemAddress; data: Hex; topics: readonly Hex[] }>;
+  for (const item of prepared) {
+    verifyDockedEvent(logs, parameters.registry, parameters.account.address, item.app, item.strategyHash);
+    parameters.logger.info(`Docked 事件校验成功：strategyHash=${item.strategyHash}`);
+    await verifyDockedRawBalances(parameters.publicClient, parameters.registry, parameters.account.address, item.app, item.strategyHash, item.tokens, parameters.logger);
+    parameters.logger.info(`仓位关闭完成：strategyHash=${item.strategyHash}`);
+  }
+}
+
+/**
+ * 脚本入口：查询当前 maker 全部 open 仓位；超过两个时原子 multicall dock，否则保持串行 dock。
+ * 任一预检或完整 batch 模拟失败均不发送交易，避免原子批次出现不可预期的部分关闭。
  */
 async function main(): Promise<void> {
   const argumentsList = process.argv.slice(2);
@@ -480,13 +545,16 @@ async function main(): Promise<void> {
       return;
     }
 
-    for (let index = 0; index < strategies.length; index += 1) {
-      const strategy = strategies[index];
-      if (!strategy) {
-        throw new Error(`读取第 ${index + 1} 个仓位时发生意外空值`);
+    if (strategies.length > 2) {
+      logger.info(`活跃仓位数=${strategies.length} > 2，启用单笔 atomic multicall dock；任一子调用失败会整批回滚`);
+      await cancelStrategiesWithMulticall({ strategies, publicClient, registry, account, chainId, chain, rpcUrl, dryRun, logger });
+    } else {
+      for (let index = 0; index < strategies.length; index += 1) {
+        const strategy = strategies[index];
+        if (!strategy) throw new Error(`读取第 ${index + 1} 个仓位时发生意外空值`);
+        logger.info(`处理第 ${index + 1}/${strategies.length} 个活跃仓位（串行 dock）`);
+        await cancelStrategy(strategy, publicClient, registry, account, chainId, chain, rpcUrl, dryRun, logger);
       }
-      logger.info(`处理第 ${index + 1}/${strategies.length} 个活跃仓位`);
-      await cancelStrategy(strategy, publicClient, registry, account, chainId, chain, rpcUrl, dryRun, logger);
     }
 
     logger.info(`${dryRun ? "dry-run 校验完成" : "全部活跃 LP 仓位已关闭"}，仓位数量=${strategies.length}`);

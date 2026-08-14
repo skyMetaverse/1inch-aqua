@@ -65,13 +65,13 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行会在本次投入尚未被现有 allowance 覆盖时尝试 `MAX_UINT256` 授权；确认后以链上实际回读的 allowance 是否覆盖本次投入为准。这样可兼容内部存储小于 `uint256` 或采用无限授权哨兵值的 ERC20。若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
 
-当配置中的仓位数超过 2 个时，脚本会先完成全部仓位的余额、价格、授权和 `ship` 模拟，再为每笔 `ship` 分配连续 nonce 并按 nonce 顺序流水线提交本地签名的 `eth_sendRawTransaction`，不等待前一笔区块确认。这会减少“逐笔确认后再发送”的等待，但链上仍是多笔独立交易，并逐笔等待回执、校验事件和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。任一 raw 交易提交失败时停止后续 nonce；已成功 hash 会先完成复核，且不会自动重发。
+当配置中的仓位数超过 2 个时，脚本会先完成全部仓位的余额、价格、授权和单笔 `ship` 模拟，按 token 汇总最新余额后，再模拟并广播一笔 Aqua registry `multicall([ship...])`。任一子调用失败时整批回滚，不会出现部分创建；成功后在同一 receipt 中逐策略校验 `Shipped`、`Pushed` 和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。multicall raw 广播失败不会自动重发。
 
 ## 一键取消全部活跃 LP 仓位
 
-脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
+脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位。仓位数不超过 2 时逐仓位发送 Aqua registry `dock`；超过 2 时，先预检和模拟所有 dock，再模拟并广播一笔 Aqua registry `multicall([dock...])`。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
 
-交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 RPC 返回 `maxPriorityFeePerGas=0`，广播层仅将 priority fee 归一化为 `1 wei`，以兼容拒绝 zero-tip 的节点；不改变 max fee，也不会自动重试 raw 广播。多笔连续 nonce 交易也不依赖 RPC 的 JSON-RPC request batch 排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
+交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 RPC 返回 `maxPriorityFeePerGas=0`，广播层仅将 priority fee 归一化为 `1 wei`，以兼容拒绝 zero-tip 的节点；不改变 max fee，也不会自动重试 raw 广播。超过两个仓位的批量 dock/ship 通过单笔 Aqua registry multicall 完成，不依赖 JSON-RPC request batch 的排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
 
 `.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC：
 
@@ -91,7 +91,7 @@ bun run cancel-all-active-lp --dry-run
 bun run cancel-all-active-lp
 ```
 
-执行过程会隐藏输入解密密码，在 `logs/` 下生成本次运行日志。日志文件名为 `YYYY-MM-DD HH-mm-ss.SSS.log`，内容格式为 `YYYY-MM-DD HH:mm:ss.SSS [info]: ...`。脚本逐仓位串行关闭；任一仓位预检、模拟、广播、回执、`Docked` 事件或关闭后链上状态复核失败时，立即停止后续仓位。
+执行过程会隐藏输入解密密码，在 `logs/` 下生成本次运行日志。日志文件名为 `YYYY-MM-DD HH-mm-ss.SSS.log`，内容格式为 `YYYY-MM-DD HH:mm:ss.SSS [info]: ...`。串行模式下任一仓位预检、模拟、广播、回执、`Docked` 事件或关闭后链上状态复核失败时，立即停止后续仓位；multicall 模式下任一子调用失败会让整笔交易回滚，成功 receipt 后仍逐仓位校验 `Docked` 和 docked `rawBalances`。
 
 为避免把单页查询结果误认为全部仓位，如果查询结果达到接口当前使用的 `limit=100`，脚本会直接停止，不会只关闭前 100 个仓位。关闭成功以链上 receipt、Aqua registry 的 `Docked` 事件以及 `rawBalances` 复核为准，策略查询接口仅用于发现候选仓位。
 

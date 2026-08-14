@@ -14,6 +14,7 @@ import {
 import { createPublicClient, defineChain, http, isAddress, type Address, type Chain, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "../../scripts/encrypt-private-key.ts";
+import { buildAquaMulticallTransaction } from "../aqua/multicall.ts";
 import { buildConcentratedStrategy } from "../aqua/strategy.ts";
 import { readJsoncFile } from "../config/jsonc.ts";
 import { validateAddLpConfig, type PositionConfig } from "../config/lp-config.ts";
@@ -31,7 +32,7 @@ import {
 import { getCurrentPrice } from "../infra/emsh.ts";
 import { ERC20_ABI, buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
-import { sendLocallySignedTransaction, sendLocallySignedTransactions } from "../infra/rpc.ts";
+import { sendLocallySignedTransaction } from "../infra/rpc.ts";
 
 const DEFAULT_CONFIG_PATH = "config/lp.add.jsonc";
 const ENV_FILE = ".env";
@@ -269,13 +270,13 @@ async function addPosition(parameters: {
 
   await parameters.publicClient.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value });
   logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);
+  if (parameters.batchShip) {
+    logger.info(`ship 已准备：strategyHash=${built.strategyHash}，等待 atomic multicall ${parameters.dryRun ? "dry-run 模拟" : "提交"}`);
+    return { index: parameters.index, built, tokens: [token0, token1], amounts: [amount0, amount1] };
+  }
   if (parameters.dryRun) {
     logger.info(`dry-run：未广播 ship，strategyHash=${built.strategyHash}`);
     return undefined;
-  }
-  if (parameters.batchShip) {
-    logger.info(`ship 已准备：strategyHash=${built.strategyHash}，等待连续 nonce 流水线提交`);
-    return { index: parameters.index, built, tokens: [token0, token1], amounts: [amount0, amount1] };
   }
 
   const hash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), built.ship);
@@ -324,9 +325,8 @@ async function verifyShipReceipt(parameters: {
 }
 
 /**
- * 流水线提交已经完成模拟的 ship。
- * 发送前重新合计同一 token 的 raw 投入，避免多个仓位各自模拟成功但合计超过钱包余额。
- * 连续 nonce 广播可能部分成功；成功 hash 必须落日志，失败时禁止自动重发。
+ * 原子提交已经完成模拟的 ship。
+ * 发送前重新合计同一 token 的 raw 投入，避免多个仓位各自模拟成功但合计超过钱包余额；完整 multicall 模拟成功后才广播一笔交易。
  */
 async function broadcastPreparedShips(parameters: {
   ships: readonly PreparedShip[];
@@ -335,6 +335,7 @@ async function broadcastPreparedShips(parameters: {
   chain: Chain;
   rpcUrl: string;
   registry: Address;
+  dryRun: boolean;
   logger: Logger;
 }): Promise<void> {
   const totals = new Map<string, { token: Address; amount: bigint }>();
@@ -351,20 +352,19 @@ async function broadcastPreparedShips(parameters: {
     if (balance < amount) throw new Error(`批量 ship 前余额不足：token=${token}，最新余额=${balance.toString()}，合计投入=${amount.toString()}`);
     parameters.logger.info(`批量 ship 余额复核：token=${token}，最新余额=${balance.toString()}，合计投入=${amount.toString()}`);
   }
-  const results = await sendLocallySignedTransactions(parameters.account, parameters.chain, http(parameters.rpcUrl, { batch: true }), parameters.ships.map((ship) => ship.built.ship));
-  results.forEach((result, index) => {
-    const ship = parameters.ships[index];
-    if (result.hash) parameters.logger.info(`流水线 ship 已提交：第 ${(ship?.index ?? index) + 1} 个 LP，strategyHash=${ship?.built.strategyHash ?? "unknown"}，交易哈希=${result.hash}`);
-    if (result.error) parameters.logger.info(`流水线 ship 提交失败：第 ${(ship?.index ?? index) + 1} 个 LP，原因=${result.error}`);
-  });
-  const confirmed = await Promise.allSettled(parameters.ships.flatMap((ship, index) => {
-    const hash = results[index]?.hash;
-    return hash ? [verifyShipReceipt({ publicClient: parameters.publicClient, registry: parameters.registry, account: parameters.account, built: ship.built, tokens: ship.tokens, amounts: ship.amounts, hash, logger: parameters.logger, index: ship.index })] : [];
-  }));
-  const receiptFailures = confirmed.flatMap((result) => result.status === "rejected" ? [result.reason instanceof Error ? result.reason.message.split("\n")[0] : "已提交 ship 的回执或复核失败"] : []);
-  if (receiptFailures.length > 0) throw new Error(`流水线 ship 已提交交易复核失败：${receiptFailures.join("；")}`);
-  const failures = results.flatMap((result, index) => result.error ? [`第 ${(parameters.ships[index]?.index ?? index) + 1} 个 LP 广播失败：${result.error}`] : []);
-  if (failures.length > 0) throw new Error(`流水线 ship 部分失败：${failures.join("；")}；已成功交易已完成复核，禁止自动重发`);
+  const multicall = buildAquaMulticallTransaction(parameters.registry, parameters.ships.map((ship) => ship.built.ship));
+  await parameters.publicClient.call({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
+  parameters.logger.info(`批量 multicall ship 链上模拟成功：子调用数=${parameters.ships.length}，data 字节数=${(multicall.data.length - 2) / 2}`);
+  if (parameters.dryRun) {
+    parameters.logger.info(`dry-run：未广播 multicall ship，子调用数=${parameters.ships.length}`);
+    return;
+  }
+  const hash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), multicall);
+  parameters.logger.info(`批量 multicall ship 已广播：子调用数=${parameters.ships.length}，交易哈希=${hash}`);
+  // 同一原子 receipt 必须逐策略复核，确保不能把“整笔成功”误认为所有 ship 都完整落链。
+  for (const ship of parameters.ships) {
+    await verifyShipReceipt({ publicClient: parameters.publicClient, registry: parameters.registry, account: parameters.account, built: ship.built, tokens: ship.tokens, amounts: ship.amounts, hash, logger: parameters.logger, index: ship.index });
+  }
 }
 
 async function main(): Promise<void> {
@@ -395,14 +395,14 @@ async function main(): Promise<void> {
     logger.info(`RPC 与 Aqua registry 校验成功：chainId=${rpcChainId}，registry=${registry}`);
 
     const batchShip = config.positions.length > 2;
-    if (batchShip && !dryRun) logger.info(`仓位数=${config.positions.length} > 2，启用 ship 连续 nonce 流水线提交；链上仍为多笔独立交易`);
+    if (batchShip && !dryRun) logger.info(`仓位数=${config.positions.length} > 2，启用单笔 atomic multicall ship；任一子调用失败会整批回滚`);
     const preparedShips: PreparedShip[] = [];
     for (const [index, position] of config.positions.entries()) {
       const prepared = await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger, batchShip });
       if (prepared) preparedShips.push(prepared);
     }
-    if (batchShip && !dryRun) {
-      await broadcastPreparedShips({ ships: preparedShips, publicClient, account, chain, rpcUrl, registry, logger });
+    if (batchShip) {
+      await broadcastPreparedShips({ ships: preparedShips, publicClient, account, chain, rpcUrl, registry, dryRun, logger });
     }
     logger.info(`${dryRun ? "添加 LP dry-run 完成" : "全部 LP 添加完成"}，仓位数=${config.positions.length}`);
   } finally {
