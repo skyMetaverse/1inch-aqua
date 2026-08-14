@@ -7,7 +7,7 @@
 import { expect, test } from "bun:test";
 import { custom, defineChain, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
+import { parseEip1559FeeOverrides, sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
 
 /** 测试专用链定义；不连接公共 RPC，也不携带任何真实账户或真实节点信息。 */
 const testChain = defineChain({
@@ -45,7 +45,7 @@ test("批量本地签名交易使用连续 nonce 并返回每笔 hash", async ()
   const results = await sendLocallySignedTransactions(testAccount, testChain, transport, [
     { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x01", value: 0n },
     { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x02", value: 0n },
-  ]);
+  ], {});
   const rawRequests = requests.filter((request) => request.method === "eth_sendRawTransaction");
   expect(results.every((result) => result.hash !== undefined && result.error === undefined)).toBe(true);
   expect(rawRequests).toHaveLength(2);
@@ -76,7 +76,7 @@ test("流水线广播在中间 nonce 失败时不提交后续交易", async () =
     { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x01", value: 0n },
     { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x02", value: 0n },
     { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x03", value: 0n },
-  ]);
+  ], {});
   expect(rawRequestCount).toBe(2);
   expect(results[0]?.hash).toBe("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
   expect(results[1]?.error).toBeDefined();
@@ -104,7 +104,7 @@ test("raw 广播拒绝时记录阶段和安全交易参数，不自动重试", a
     to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a",
     data: "0x28defc17",
     value: 0n,
-  })).rejects.toThrow("raw 广播失败：nonce=12，gas=100000，maxFeePerGas=2200000000，maxPriorityFeePerGas=1000000000，原因=Missing or invalid parameters.");
+  }, {})).rejects.toThrow("raw 广播失败：nonce=12，gas=100000，maxFeePerGas=2200000000，maxPriorityFeePerGas=1000000000，原因=Missing or invalid parameters.");
   expect(rawRequestCount).toBe(1);
   expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
 });
@@ -126,7 +126,7 @@ test("RPC 返回零 priority fee 时以 1 wei 广播，兼容要求最小 tip �
     to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a",
     data: "0x28defc17",
     value: 0n,
-  });
+  }, {});
   const raw = requests.find((request) => request.method === "eth_sendRawTransaction")?.params?.[0] as Hex;
   expect(parseTransaction(raw).maxPriorityFeePerGas).toBe(1n);
 });
@@ -155,7 +155,7 @@ test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () =>
     gas: 100000n,
     maxFeePerGas: 2_000_000_000n,
     maxPriorityFeePerGas: 1_000_000_000n,
-  });
+  }, {});
 
   const rawTransactionRequest = requests.find((request) => request.method === "eth_sendRawTransaction");
 
@@ -167,4 +167,50 @@ test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () =>
   expect(rawTransactionRequest?.params).toHaveLength(1);
   expect(typeof rawTransactionRequest?.params?.[0]).toBe("string");
   expect((rawTransactionRequest?.params?.[0] as string).startsWith("0x")).toBe(true);
+});
+
+/** 自定义费率必须成对出现，并以整数 wei 精确表达，防止 dotenv 文本被浮点数或半配置静默误用。 */
+test("解析 .env 自定义 EIP-1559 费率并拒绝半配置", () => {
+  expect(parseEip1559FeeOverrides("MAX_FEE_PER_GAS_GWEI=25.5\nMAX_PRIORITY_FEE_PER_GAS_GWEI=1.25\n")).toEqual({
+    maxFeePerGas: 25_500_000_000n,
+    maxPriorityFeePerGas: 1_250_000_000n,
+  });
+  expect(() => parseEip1559FeeOverrides("MAX_FEE_PER_GAS_GWEI=25\n")).toThrow("必须同时设置");
+});
+
+/** 自定义 max fee 仍要读取链上 base fee，签出的最终交易必须精确使用 dotenv 覆盖值而不是 RPC 估算值。 */
+test("自定义 EIP-1559 费率使用链上 base fee 校验后本地签名", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x4a817c800" } as unknown as Hex;
+      if (args.method === "eth_sendRawTransaction") return "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  await sendLocallySignedTransaction(testAccount, testChain, transport, {
+    to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x28defc17", value: 0n, nonce: 1, gas: 100000n,
+  }, { maxFeePerGas: 25_000_000_000n, maxPriorityFeePerGas: 2_000_000_000n });
+  const raw = requests.find((request) => request.method === "eth_sendRawTransaction")?.params?.[0] as Hex;
+  expect(parseTransaction(raw).maxFeePerGas).toBe(25_000_000_000n);
+  expect(parseTransaction(raw).maxPriorityFeePerGas).toBe(2_000_000_000n);
+  expect(requests.some((request) => request.method === "eth_getBlockByNumber")).toBe(true);
+  expect(requests.some((request) => request.method === "eth_maxPriorityFeePerGas")).toBe(false);
+});
+
+/** 基础费上涨超过用户 max fee 时必须在广播前拒绝，不能让节点接收注定不可打包的 raw transaction。 */
+test("自定义 max fee 未覆盖链上 base fee 与 priority fee 时拒绝广播", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x4a817c800" } as unknown as Hex;
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  await expect(sendLocallySignedTransaction(testAccount, testChain, transport, {
+    to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x28defc17", value: 0n, nonce: 1, gas: 100000n,
+  }, { maxFeePerGas: 21_000_000_000n, maxPriorityFeePerGas: 2_000_000_000n })).rejects.toThrow("未覆盖最新链上 base fee 与 priority fee");
+  expect(requests.some((request) => request.method === "eth_sendRawTransaction")).toBe(false);
 });

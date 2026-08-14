@@ -391,7 +391,7 @@ shipTransactionHash?
 1. 校验 API strategy hash、strategy bytes、maker、chain、app 和 token 列表。
 2. 链上读取全部 rawBalances，并要求与 API 计划 raw 金额完全一致。
 3. 构建并 `eth_call` 模拟 dock。
-4. 使用 `PrivateKeyAccount` 本地签名；广播前显式读取 pending nonce、估算 gas 和 EIP-1559 fee，通过 `eth_sendRawTransaction` 广播，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。
+4. 使用 `PrivateKeyAccount` 本地签名；广播前显式读取 pending nonce、估算 gas 和最新区块 EIP-1559 `baseFeePerGas`，通过 `eth_sendRawTransaction` 广播，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 .env 同时设置 `MAX_FEE_PER_GAS_GWEI` 与 `MAX_PRIORITY_FEE_PER_GAS_GWEI`，则采用该对上限，并在 `maxFee < baseFee + priority` 时本地拒绝广播。
 5. 等待至少一个确认。
 6. 校验目标 `Docked` 事件。
 7. 回读全部 rawBalances，确认余额为零且 tokensCount 为 docked 哨兵。

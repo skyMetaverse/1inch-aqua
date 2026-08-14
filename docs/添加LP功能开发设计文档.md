@@ -225,6 +225,9 @@ JSONC 解析必须在读取后转换为标准对象，再进行严格结构校�
 ```dotenv
 ENCRYPTED_PRIVATE_KEY=<已有加密私钥密文>
 RPC_URL=https://your-rpc.example
+# 可选：两项必须同时填写，单位 gwei；留空时使用 RPC 估算。
+MAX_FEE_PER_GAS_GWEI=
+MAX_PRIORITY_FEE_PER_GAS_GWEI=
 ```
 
 规则：
@@ -234,6 +237,7 @@ RPC_URL=https://your-rpc.example
 - 私钥不允许出现在日志、错误信息、命令行参数或文件中。
 - 调用方持有的私钥 Buffer 在成功和异常路径都必须 `fill(0)`。
 - `RPC_URL` 可以在启动时记录脱敏后的主机信息，但不能输出包含凭证的完整 URL。
+- `MAX_FEE_PER_GAS_GWEI` 与 `MAX_PRIORITY_FEE_PER_GAS_GWEI` 必须同时设置；它们覆盖 RPC EIP-1559 估算的同名交易字段，但每笔交易仍从最新区块读取 `baseFeePerGas`，并在 `maxFee < baseFee + priority` 时拒绝签名和广播。
 
 ## 6. 价格与精度设计
 
@@ -526,7 +530,7 @@ logs/2026-07-24 18-30-55.545.log
 3. 对每个 API 仓位校验 maker、chainId、地址、完整 token 列表，以及 `strategyHash = keccak256(strategyBytes)`。
 4. 使用仓位返回的原始 `app` 构建 dock，避免用固定 router 地址覆盖仓位创建时的 app。
 5. 在广播前读取每个 token 的 `rawBalances` 并使用 `eth_call` 模拟 dock。
-6. 使用解密私钥派生的本地 `PrivateKeyAccount` 签名，通过 RPC 的 `eth_sendRawTransaction` 广播；广播前显式读取 pending nonce、估算 gas 和 EIP-1559 fee，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`；禁止将裸 maker 地址作为账户传给 `viem`，以免错误调用节点代签的 `eth_sendTransaction`。
+6. 使用解密私钥派生的本地 `PrivateKeyAccount` 签名，通过 RPC 的 `eth_sendRawTransaction` 广播；广播前显式读取 pending nonce、估算 gas，并从最新区块读取 EIP-1559 `baseFeePerGas`。若 .env 同时配置 max fee 与 priority fee，则使用该对上限并验证其覆盖链上 `baseFee + priority`；不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`；禁止将裸 maker 地址作为账户传给 `viem`，以免错误调用节点代签的 `eth_sendTransaction`。
 7. 仓位数不超过两个时串行关闭；超过两个时，在每个 dock 预检和单笔模拟通过后，再模拟并估算 gas，最后广播单笔 `multicall([dock...])`。multicall 任一子调用失败时整批回滚，不会部分关闭。
 8. 串行模式下每笔成功交易、multicall 模式下每个子策略，均必须通过 receipt status、目标 `Docked` 事件和关闭后的 `rawBalances` 状态复核。
 9. 只关闭仓位，不撤销 ERC20 allowance；撤销授权保留为独立后续操作。

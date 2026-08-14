@@ -1,8 +1,9 @@
 /**
  * 本地私钥签名与 RPC 广播模块。
  * 核心功能：用 PrivateKeyAccount 在本机签名交易，通过 eth_sendRawTransaction 广播并等待成功回执。
- * 主要流程：读取 nonce/gas/fee -> 本地账户签名 -> eth_sendRawTransaction 广播；禁止裸地址账户触发节点代签。
+ * 主要流程：读取 pending nonce/gas/最新区块 base fee -> 应用 .env 或 RPC 的 EIP-1559 fee -> 本地账户签名 -> eth_sendRawTransaction 广播；禁止裸地址账户触发节点代签。
  */
+import { readFileSync } from "node:fs";
 import { createPublicClient, type Address, type Chain, type Hex, type Transport } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
 
@@ -19,6 +20,62 @@ export interface TransactionRequest {
 export interface BatchBroadcastResult {
   hash?: Hex;
   error?: string;
+}
+
+/** .env 中可选的 EIP-1559 绝对费率上限；单位转换后始终使用 wei。 */
+export interface Eip1559FeeOverrides {
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
+}
+
+const GWEI_IN_WEI = 1_000_000_000n;
+const MAX_FEE_PER_GAS_FIELD = "MAX_FEE_PER_GAS_GWEI";
+const MAX_PRIORITY_FEE_PER_GAS_FIELD = "MAX_PRIORITY_FEE_PER_GAS_GWEI";
+
+/** 将最多九位小数的 gwei 文本精确转换为 wei，禁止浮点数导致费率精度漂移。 */
+function parseGweiToWei(value: string, field: string): bigint {
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/.test(value)) throw new Error(`.env 中 ${field} 必须是最多 9 位小数的非负 gwei 十进制数`);
+  const [whole, fraction = ""] = value.split(".");
+  return BigInt(whole ?? "0") * GWEI_IN_WEI + BigInt(fraction.padEnd(9, "0"));
+}
+
+/** 从 dotenv 文本提取一个字段；空值表示未配置，避免将注释或其他环境变量带入费率解析。 */
+function dotenvValue(content: string, field: string): string | undefined {
+  const pattern = new RegExp(`^\\s*${field}\\s*=\\s*(.*?)\\s*$`);
+  for (const line of content.split(/\r?\n/)) {
+    const matched = line.match(pattern);
+    if (!matched) continue;
+    const value = matched[1]?.trim() ?? "";
+    if (value === "") return undefined;
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) return value.slice(1, -1);
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * 解析一对自定义 EIP-1559 上限。两项必须成对设置，避免只覆盖 priority 或 max fee 后无意混用 RPC 报价。
+ * 环境配置绝不包含 base fee：基础费仍在每次签名前从最新链上区块读取并参与下限校验。
+ */
+export function parseEip1559FeeOverrides(dotenvContent: string): Eip1559FeeOverrides {
+  const maxFeeText = dotenvValue(dotenvContent, MAX_FEE_PER_GAS_FIELD);
+  const maxPriorityText = dotenvValue(dotenvContent, MAX_PRIORITY_FEE_PER_GAS_FIELD);
+  if (maxFeeText === undefined && maxPriorityText === undefined) return {};
+  if (maxFeeText === undefined || maxPriorityText === undefined) throw new Error(`.env 中 ${MAX_FEE_PER_GAS_FIELD} 与 ${MAX_PRIORITY_FEE_PER_GAS_FIELD} 必须同时设置`);
+  const maxFeePerGas = parseGweiToWei(maxFeeText, MAX_FEE_PER_GAS_FIELD);
+  const maxPriorityFeePerGas = parseGweiToWei(maxPriorityText, MAX_PRIORITY_FEE_PER_GAS_FIELD);
+  if (maxFeePerGas <= 0n) throw new Error(`.env 中 ${MAX_FEE_PER_GAS_FIELD} 必须大于 0`);
+  return { maxFeePerGas, maxPriorityFeePerGas };
+}
+
+/** 读取本地 .env 的自定义费率；没有 .env 时返回空配置，让测试和不依赖 dotenv 的调用保持可用。 */
+export function readEip1559FeeOverrides(envPath = ".env"): Eip1559FeeOverrides {
+  try {
+    return parseEip1559FeeOverrides(readFileSync(envPath, "utf8"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return {};
+    throw error;
+  }
 }
 
 /**
@@ -50,22 +107,50 @@ interface Eip1559Fees {
 
 /**
  * 归一化 EIP-1559 fee。部分 RPC 返回 0 priority fee，但 Zan 等节点拒绝 zero tip；1 wei 是不改变报价量级的最小可接受值。
- * maxFeePerGas 仍必须覆盖归一化后的 priority fee，避免为了兼容节点构造实际无效交易。
+ * 即使 maxFee/priority 来自 .env，也必须用最新链上 base fee 验证 `maxFee >= baseFee + priority`，避免基础费上涨后签出无效交易。
  */
 function resolveEip1559Fees(
   transaction: TransactionRequest,
   estimated: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint },
+  baseFeePerGas: bigint,
+  overrides: Eip1559FeeOverrides,
 ): Eip1559Fees {
-  const maxFeePerGas = transaction.maxFeePerGas ?? estimated.maxFeePerGas;
-  const estimatedPriorityFee = transaction.maxPriorityFeePerGas ?? estimated.maxPriorityFeePerGas;
-  if (maxFeePerGas === undefined || estimatedPriorityFee === undefined || maxFeePerGas <= 0n) {
-    throw new Error("RPC 未返回有效 EIP-1559 gas fee");
+  const maxFeePerGas = overrides.maxFeePerGas ?? transaction.maxFeePerGas ?? estimated.maxFeePerGas;
+  const candidatePriorityFee = overrides.maxPriorityFeePerGas ?? transaction.maxPriorityFeePerGas ?? estimated.maxPriorityFeePerGas;
+  if (maxFeePerGas === undefined || candidatePriorityFee === undefined || maxFeePerGas <= 0n || baseFeePerGas < 0n) {
+    throw new Error("RPC 未返回有效 EIP-1559 gas fee 或链上 base fee");
   }
-  const maxPriorityFeePerGas = estimatedPriorityFee === 0n ? 1n : estimatedPriorityFee;
-  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
-    throw new Error("EIP-1559 maxFeePerGas 未覆盖 priority fee");
-  }
+  const maxPriorityFeePerGas = candidatePriorityFee === 0n ? 1n : candidatePriorityFee;
+  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) throw new Error("EIP-1559 maxFeePerGas 未覆盖 priority fee");
+  if (maxFeePerGas < baseFeePerGas + maxPriorityFeePerGas) throw new Error(`EIP-1559 maxFeePerGas 未覆盖最新链上 base fee 与 priority fee：baseFeePerGas=${baseFeePerGas.toString()}，maxPriorityFeePerGas=${maxPriorityFeePerGas.toString()}`);
   return { maxFeePerGas, maxPriorityFeePerGas };
+}
+
+interface Eip1559FeeContext {
+  baseFeePerGas: bigint;
+  estimated: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint };
+}
+
+/**
+ * 读取当前区块基础费并获取必要的 RPC 费率估算。批量交易共享同一基础费快照，但仍可逐笔保留显式 fee 参数。
+ * .env 覆盖优先于单次调用参数与 RPC 估算，确保所有发送入口采用同一用户配置；但 base fee 永远来自链上。
+ */
+async function readEip1559FeeContext(
+  publicClient: ReturnType<typeof createPublicClient>,
+  transactions: readonly TransactionRequest[],
+  overrides: Eip1559FeeOverrides,
+): Promise<Eip1559FeeContext> {
+  if (transactions.length === 0) throw new Error("批量交易不能为空");
+  const needsEstimatedFees = transactions.some((transaction) =>
+    (overrides.maxFeePerGas ?? transaction.maxFeePerGas) === undefined
+    || (overrides.maxPriorityFeePerGas ?? transaction.maxPriorityFeePerGas) === undefined,
+  );
+  const [latestBlock, estimated] = await Promise.all([
+    publicClient.getBlock({ blockTag: "latest" }),
+    needsEstimatedFees ? publicClient.estimateFeesPerGas() : Promise.resolve({}),
+  ]);
+  if (latestBlock.baseFeePerGas == null) throw new Error("最新链上区块未返回 EIP-1559 baseFeePerGas");
+  return { baseFeePerGas: latestBlock.baseFeePerGas, estimated };
 }
 
 /** 使用明确参数构建一笔本地签名交易，避免 viem 隐式调用 eth_fillTransaction。 */
@@ -100,6 +185,7 @@ export async function sendLocallySignedTransaction(
   chain: Chain,
   transport: Transport,
   transaction: TransactionRequest,
+  feeOverrides: Eip1559FeeOverrides = readEip1559FeeOverrides(),
 ): Promise<Hex> {
   const publicClient = createPublicClient({ chain, transport });
   let nonce: number;
@@ -116,22 +202,14 @@ export async function sendLocallySignedTransaction(
     throw new Error(`估算 gas 失败：nonce=${nonce}，原因=${firstErrorLine(error)}`);
   }
 
-  let estimatedFees: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint };
-  try {
-    estimatedFees = transaction.maxFeePerGas !== undefined && transaction.maxPriorityFeePerGas !== undefined
-      ? { maxFeePerGas: transaction.maxFeePerGas, maxPriorityFeePerGas: transaction.maxPriorityFeePerGas }
-      : await publicClient.estimateFeesPerGas();
-  } catch (error) {
-    throw new Error(`估算 EIP-1559 fee 失败：nonce=${nonce}，gas=${gas}，原因=${firstErrorLine(error)}`);
-  }
-
   let fees: Eip1559Fees;
   let serialized: Hex;
   try {
-    fees = resolveEip1559Fees(transaction, estimatedFees);
+    const feeContext = await readEip1559FeeContext(publicClient, [transaction], feeOverrides);
+    fees = resolveEip1559Fees(transaction, feeContext.estimated, feeContext.baseFeePerGas, feeOverrides);
     serialized = await signPreparedTransaction(account, chain, transaction, nonce, gas, fees);
   } catch (error) {
-    throw new Error(`本地签名失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${estimatedFees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${estimatedFees.maxPriorityFeePerGas ?? "unknown"}，原因=${firstErrorLine(error)}`);
+    throw new Error(`EIP-1559 fee 解析或本地签名失败：nonce=${nonce}，gas=${gas}，原因=${firstErrorLine(error)}`);
   }
 
   try {
@@ -152,14 +230,23 @@ export async function sendLocallySignedTransactions(
   chain: Chain,
   transport: Transport,
   transactions: readonly TransactionRequest[],
+  feeOverrides: Eip1559FeeOverrides = readEip1559FeeOverrides(),
 ): Promise<BatchBroadcastResult[]> {
   if (transactions.length === 0) return [];
   const publicClient = createPublicClient({ chain, transport });
   try {
     const startNonce = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
-    const estimatedFees = await publicClient.estimateFeesPerGas();
+    // 同一批独立交易共享本轮最新 base fee 与 RPC quote，避免每笔读取不同区块；最终 fee 仍按每笔显式参数解析。
+    const feeContext = await readEip1559FeeContext(publicClient, transactions, feeOverrides);
     const gasValues = await Promise.all(transactions.map((transaction) => transaction.gas ?? publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value })));
-    const serialized = await Promise.all(transactions.map((transaction, index) => signPreparedTransaction(account, chain, transaction, transaction.nonce ?? startNonce + index, gasValues[index] ?? 0n, resolveEip1559Fees(transaction, estimatedFees))));
+    const serialized = await Promise.all(transactions.map((transaction, index) => signPreparedTransaction(
+      account,
+      chain,
+      transaction,
+      transaction.nonce ?? startNonce + index,
+      gasValues[index] ?? 0n,
+      resolveEip1559Fees(transaction, feeContext.estimated, feeContext.baseFeePerGas, feeOverrides),
+    )));
     const results: BatchBroadcastResult[] = [];
     for (const [index, raw] of serialized.entries()) {
       try {

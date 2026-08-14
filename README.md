@@ -71,12 +71,15 @@ bun run add-lp config/lp.add.jsonc
 
 脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位。仓位数不超过 2 时逐仓位发送 Aqua registry `dock`；超过 2 时，先预检和模拟所有 dock，再模拟并广播一笔 Aqua registry `multicall([dock...])`。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
 
-交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 RPC 返回 `maxPriorityFeePerGas=0`，广播层仅将 priority fee 归一化为 `1 wei`，以兼容拒绝 zero-tip 的节点；不改变 max fee，也不会自动重试 raw 广播。超过两个仓位的批量 dock/ship 通过单笔 Aqua registry multicall 完成，不依赖 JSON-RPC request batch 的排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
+交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas，并在每笔签名前从最新链上区块读取 EIP-1559 `baseFeePerGas`；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 RPC 返回 `maxPriorityFeePerGas=0`，广播层仅将 priority fee 归一化为 `1 wei`，以兼容拒绝 zero-tip 的节点；不改变 max fee，也不会自动重试 raw 广播。超过两个仓位的批量 dock/ship 通过单笔 Aqua registry multicall 完成，不依赖 JSON-RPC request batch 的排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
 
-`.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC：
+`.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC。可选的两项自定义 EIP-1559 上限必须同时填写，单位为 gwei；两项留空时回退到 RPC 估算。`MAX_FEE_PER_GAS_GWEI` 是标准交易 `maxFeePerGas` 的绝对上限，必须覆盖每笔从链上读取的 `baseFeePerGas + MAX_PRIORITY_FEE_PER_GAS_GWEI`，否则脚本拒绝签名和广播。
 
 ```dotenv
 RPC_URL=https://your-rpc.example
+# 例如：请按自身成本上限填写，不要复制示例值作为市场报价。
+MAX_FEE_PER_GAS_GWEI=
+MAX_PRIORITY_FEE_PER_GAS_GWEI=
 ```
 
 先运行 dry-run。该模式会查询仓位、校验 `strategyBytes` 哈希、读取链上 `rawBalances` 并模拟每笔 `dock`，但绝不广播交易：
