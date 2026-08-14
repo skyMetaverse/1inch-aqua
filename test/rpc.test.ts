@@ -109,6 +109,28 @@ test("raw 广播拒绝时记录阶段和安全交易参数，不自动重试", a
   expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
 });
 
+test("RPC 返回零 priority fee 时以 1 wei 广播，兼容要求最小 tip 的节点", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0xd";
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x0";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" } as unknown as Hex;
+      if (args.method === "eth_sendRawTransaction") return "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  await sendLocallySignedTransaction(testAccount, testChain, transport, {
+    to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a",
+    data: "0x28defc17",
+    value: 0n,
+  });
+  const raw = requests.find((request) => request.method === "eth_sendRawTransaction")?.params?.[0] as Hex;
+  expect(parseTransaction(raw).maxPriorityFeePerGas).toBe(1n);
+});
+
 test("本地私钥账户必须通过 eth_sendRawTransaction 广播", async () => {
   const requests: Array<{ method: string; params?: unknown[] }> = [];
   const transport = custom({

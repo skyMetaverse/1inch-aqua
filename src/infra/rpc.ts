@@ -43,6 +43,31 @@ function firstErrorLine(error: unknown): string {
   return messages.find((message) => !/^An unknown RPC error occurred\.?$/i.test(message)) ?? messages[0] ?? "未知错误";
 }
 
+interface Eip1559Fees {
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+}
+
+/**
+ * 归一化 EIP-1559 fee。部分 RPC 返回 0 priority fee，但 Zan 等节点拒绝 zero tip；1 wei 是不改变报价量级的最小可接受值。
+ * maxFeePerGas 仍必须覆盖归一化后的 priority fee，避免为了兼容节点构造实际无效交易。
+ */
+function resolveEip1559Fees(
+  transaction: TransactionRequest,
+  estimated: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint },
+): Eip1559Fees {
+  const maxFeePerGas = transaction.maxFeePerGas ?? estimated.maxFeePerGas;
+  const estimatedPriorityFee = transaction.maxPriorityFeePerGas ?? estimated.maxPriorityFeePerGas;
+  if (maxFeePerGas === undefined || estimatedPriorityFee === undefined || maxFeePerGas <= 0n) {
+    throw new Error("RPC 未返回有效 EIP-1559 gas fee");
+  }
+  const maxPriorityFeePerGas = estimatedPriorityFee === 0n ? 1n : estimatedPriorityFee;
+  if (maxPriorityFeePerGas <= 0n || maxFeePerGas < maxPriorityFeePerGas) {
+    throw new Error("EIP-1559 maxFeePerGas 未覆盖 priority fee");
+  }
+  return { maxFeePerGas, maxPriorityFeePerGas };
+}
+
 /** 使用明确参数构建一笔本地签名交易，避免 viem 隐式调用 eth_fillTransaction。 */
 async function signPreparedTransaction(
   account: PrivateKeyAccount,
@@ -50,19 +75,14 @@ async function signPreparedTransaction(
   transaction: TransactionRequest,
   nonce: number,
   gas: bigint,
-  fees: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint },
+  fees: Eip1559Fees,
 ): Promise<Hex> {
-  const maxFeePerGas = transaction.maxFeePerGas ?? fees.maxFeePerGas;
-  const maxPriorityFeePerGas = transaction.maxPriorityFeePerGas ?? fees.maxPriorityFeePerGas;
-  if (maxFeePerGas === undefined || maxPriorityFeePerGas === undefined || maxFeePerGas < maxPriorityFeePerGas) {
-    throw new Error("RPC 未返回有效 EIP-1559 gas fee");
-  }
   return account.signTransaction({
     chainId: chain.id,
     nonce,
     gas,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
+    maxFeePerGas: fees.maxFeePerGas,
+    maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
     to: transaction.to,
     data: transaction.data,
     value: transaction.value,
@@ -96,20 +116,22 @@ export async function sendLocallySignedTransaction(
     throw new Error(`估算 gas 失败：nonce=${nonce}，原因=${firstErrorLine(error)}`);
   }
 
-  let fees: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint };
+  let estimatedFees: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint };
   try {
-    fees = transaction.maxFeePerGas !== undefined && transaction.maxPriorityFeePerGas !== undefined
+    estimatedFees = transaction.maxFeePerGas !== undefined && transaction.maxPriorityFeePerGas !== undefined
       ? { maxFeePerGas: transaction.maxFeePerGas, maxPriorityFeePerGas: transaction.maxPriorityFeePerGas }
       : await publicClient.estimateFeesPerGas();
   } catch (error) {
     throw new Error(`估算 EIP-1559 fee 失败：nonce=${nonce}，gas=${gas}，原因=${firstErrorLine(error)}`);
   }
 
+  let fees: Eip1559Fees;
   let serialized: Hex;
   try {
+    fees = resolveEip1559Fees(transaction, estimatedFees);
     serialized = await signPreparedTransaction(account, chain, transaction, nonce, gas, fees);
   } catch (error) {
-    throw new Error(`本地签名失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${fees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${fees.maxPriorityFeePerGas ?? "unknown"}，原因=${firstErrorLine(error)}`);
+    throw new Error(`本地签名失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${estimatedFees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${estimatedFees.maxPriorityFeePerGas ?? "unknown"}，原因=${firstErrorLine(error)}`);
   }
 
   try {
@@ -135,9 +157,9 @@ export async function sendLocallySignedTransactions(
   const publicClient = createPublicClient({ chain, transport });
   try {
     const startNonce = await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
-    const fees = await publicClient.estimateFeesPerGas();
+    const estimatedFees = await publicClient.estimateFeesPerGas();
     const gasValues = await Promise.all(transactions.map((transaction) => transaction.gas ?? publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value })));
-    const serialized = await Promise.all(transactions.map((transaction, index) => signPreparedTransaction(account, chain, transaction, transaction.nonce ?? startNonce + index, gasValues[index] ?? 0n, fees)));
+    const serialized = await Promise.all(transactions.map((transaction, index) => signPreparedTransaction(account, chain, transaction, transaction.nonce ?? startNonce + index, gasValues[index] ?? 0n, resolveEip1559Fees(transaction, estimatedFees))));
     const results: BatchBroadcastResult[] = [];
     for (const [index, raw] of serialized.entries()) {
       try {

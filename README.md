@@ -71,7 +71,7 @@ bun run add-lp config/lp.add.jsonc
 
 脚本通过 1inch Aqua 网页端的 maker 策略查询接口获取当前钱包的 `open` 仓位，再对每个仓位串行发送 Aqua registry 的 `dock` 交易。`dock` 只关闭策略的虚拟余额配置，代币始终留在钱包中；脚本不会撤销已有 ERC20 最大授权。
 
-交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。多笔连续 nonce 交易也不依赖 RPC 的 JSON-RPC request batch 排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
+交易在本机用解密私钥签名，RPC 仅接收已签名交易的 `eth_sendRawTransaction` 广播请求，不要求也不使用节点托管账户的 `eth_sendTransaction`。广播层会显式读取 pending nonce、估算 gas 和 EIP-1559 fee，再本地签名 raw transaction；不会调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 RPC 返回 `maxPriorityFeePerGas=0`，广播层仅将 priority fee 归一化为 `1 wei`，以兼容拒绝 zero-tip 的节点；不改变 max fee，也不会自动重试 raw 广播。多笔连续 nonce 交易也不依赖 RPC 的 JSON-RPC request batch 排序语义。因此应使用支持标准 raw transaction 广播的 RPC。
 
 `.env` 除 `ENCRYPTED_PRIVATE_KEY` 外还必须配置可广播交易的 RPC：
 
