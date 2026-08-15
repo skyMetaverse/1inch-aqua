@@ -372,7 +372,15 @@ async function executeShip(parameters: { plan: PersistedPlan; state: StateDocume
     if (confirmedAllowance === MAX_UINT256) parameters.maximumAllowanceCache.add(cacheKey);
   }
   parameters.logger.info(`ship 使用已冻结的 dock 后钱包快照：strategyHash=${built.strategyHash}，token0 raw=${frozen.targetAmountsRaw[0]}，token1 raw=${frozen.targetAmountsRaw[1]}`);
-  await parameters.client.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value });
+  try {
+    await parameters.client.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value });
+  } catch (error) {
+    // 最大授权可能在运行中被外部 revoke；模拟失败后移除缓存，下一轮恢复同一计划时重新读取链上额度，而不是盲目重发 ship。
+    for (const [index, token] of frozen.tokens.entries()) {
+      if (BigInt(frozen.targetAmountsRaw[index] ?? "") > 0n) parameters.maximumAllowanceCache.delete(maximumAllowanceCacheKey(parameters.account.address, parameters.registry, requireAddress(token, "计划 token")));
+    }
+    throw error;
+  }
   parameters.logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);
   plan = { ...frozen, stage: "SHIP_SENT", updatedAt: Date.now() };
   updatePlan(parameters.state, plan, parameters.config);
