@@ -57,7 +57,7 @@ async function sendOrReconcileBroadcast(parameters: { account: PrivateKeyAccount
 }
 
 /**
- * 解释策略为何不能进入自动处理。官方 status=open 会包含多种分类状态；illiquidity 的交易语义尚未由真实接口或 SDK 确认，必须保守阻止自动 dock/ship。
+ * 校验策略是否属于 Bot 可处理范围。illiquidity 是明确的强制重挂触发状态；其他未知状态仍阻止自动交易，避免把 API 标签擅自当作可交易状态。
  */
 export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | "chainId" | "app" | "classification">, expectedMaker: Address, expectedChainId: number, expectedApp: Address): string | null {
   const reasons: string[] = [];
@@ -65,7 +65,7 @@ export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | 
   if (strategy.chainId !== expectedChainId) reasons.push(`chainId 不匹配：${strategy.chainId}`);
   if (strategy.app.toLowerCase() !== expectedApp.toLowerCase()) reasons.push(`app 不匹配：${strategy.app}`);
   if (strategy.classification.type !== "concentrated") reasons.push(`策略类型=${strategy.classification.type}，仅支持 concentrated`);
-  if (strategy.classification.state !== "active") reasons.push(`策略状态=${strategy.classification.state}，当前仅自动处理 active；illiquidity 语义待确认`);
+  if (strategy.classification.state !== "active" && strategy.classification.state !== "illiquidity") reasons.push(`策略状态=${strategy.classification.state}，仅自动处理 active 或 illiquidity`);
   return reasons.length > 0 ? reasons.join("；") : null;
 }
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
@@ -162,7 +162,7 @@ function dashboardStatus(decision: ReturnType<typeof decideRebalance>): Dashboar
 }
 
 /** 将精确 bigint 快照转换为仅用于终端呈现的行；文件日志仍保留完整原始字段和原因。 */
-function dashboardRow(strategy: ApiStrategy, range: { min: bigint; current: bigint; max: bigint }, outside: bigint, breachCount: number, requiredBreaches: number, priceDeviation: bigint, decision: ReturnType<typeof decideRebalance>): RebalanceDashboardRow {
+function dashboardRow(strategy: ApiStrategy, range: { min: bigint; current: bigint; max: bigint }, outside: bigint, breachCount: number, requiredBreaches: number, priceDeviation: bigint | null, decision: ReturnType<typeof decideRebalance>): RebalanceDashboardRow {
   return {
     strategyHash: strategy.strategyHash,
     pair: `${strategy.tokens[0].symbol}/${strategy.tokens[1].symbol}`,
@@ -171,7 +171,7 @@ function dashboardRow(strategy: ApiStrategy, range: { min: bigint; current: bigi
     max: formatFixed(range.max),
     outside: `${formatFixed(outside)}%`,
     breach: `${breachCount}/${requiredBreaches}`,
-    deviation: `${formatFixed(priceDeviation)}%`,
+    deviation: priceDeviation === null ? "--" : `${formatFixed(priceDeviation)}%`,
     status: dashboardStatus(decision),
     reason: decision.reason,
   };
@@ -377,7 +377,7 @@ function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint,
   return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetSqrtPriceMin: aquaRange.sqrtPriceMin.toString(), targetSqrtPriceMax: aquaRange.sqrtPriceMax.toString(), fee: config.rebalance.fee, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED" };
 }
 
-/** 每轮处理 API 返回的完整仓位集合；每个 strategyHash 都是独立仓位，同 pair 不再互相跳过。 */
+/** 每轮处理 API 返回的完整仓位集合；每个 strategyHash 都是独立仓位，同 pair 不再互相跳过。illiquidity 会在价格读取后直接创建重挂计划。 */
 async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: RebalanceConfig; state: StateDocument; account: PrivateKeyAccount; app: Address; logger: Logger; terminal?: RebalanceTerminalDashboard; execute: (plan: PersistedPlan) => Promise<void> }): Promise<void> {
   parameters.terminal?.beginSnapshot(parameters.strategies.length);
   const supported = parameters.strategies.filter((strategy) => {
@@ -389,8 +389,9 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
     }
     return true;
   });
-  const uniquePairs = [...new Map(supported.map((strategy) => [marketKey(strategy.tokens), [strategy.tokens[0].address, strategy.tokens[1].address] as [Address, Address]])).values()];
-  const marketResults = await getPairMarkets(parameters.config.chainId, uniquePairs);
+  // illiquidity 是直接关闭重开，不依赖 Pair 市场接口；active 策略仍需要该独立价格源交叉校验。
+  const uniquePairs = [...new Map(supported.filter((strategy) => strategy.classification.state === "active").map((strategy) => [marketKey(strategy.tokens), [strategy.tokens[0].address, strategy.tokens[1].address] as [Address, Address]])).values()];
+  const marketResults = uniquePairs.length > 0 ? await getPairMarkets(parameters.config.chainId, uniquePairs) : [];
   const markets = new Map(uniquePairs.map((pair, index) => [`${pair[0].toLowerCase()}:${pair[1].toLowerCase()}`, marketResults[index]]));
   for (const strategy of supported) {
     const key = logicalKey(strategy); const existingPlan = parameters.state.plans[key];
@@ -398,21 +399,26 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
     if (existingPlan?.shipStrategyHash && existingPlan.shipStrategyHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { const reason = `等待策略 API 索引新 hash=${existingPlan.shipStrategyHash}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，当前仍返回=${strategy.strategyHash}`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, "PLAN", reason)); continue; }
     const recalculatedHash = AquaProtocolContract.calculateStrategyHash(new HexString(strategy.strategyBytes)).toString();
     if (recalculatedHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：strategyBytes hash 校验失败，实际=${recalculatedHash}`); continue; }
-    const market = markets.get(marketKey(strategy.tokens)); if (!market) throw new Error(`缺少 strategyHash=${strategy.strategyHash} 的 Pair 市场数据`);
+    const market = markets.get(marketKey(strategy.tokens));
+    if (!market && strategy.classification.state === "active") throw new Error(`缺少 strategyHash=${strategy.strategyHash} 的 Pair 市场数据`);
     try {
       const currentResponse = await getCurrentPrice(strategy.tokens[0].address, strategy.tokens[1].address, strategy.chainId); currentTimestampValid(currentResponse.timestamp, parameters.config.polling.maxCurrentPriceAgeSeconds); const currentResult = parseDecimalFloor(currentResponse.priceText, 18, "EMSH current"); const current = currentResult.value; if (currentResult.truncated) parameters.logger.info(`EMSH current 精度处理：strategyHash=${strategy.strategyHash}，价格超过 18 位，向下取整；舍弃小数=${currentResult.discardedFraction}`);
-      const pairPrice = parseDecimal(String(market.lastPrice), 18, "Pair lastPrice"); const priceDeviation = relativePriceDeviationPercent(current, pairPrice); const maxDeviation = parsePercentage(parameters.config.market.maxPairPriceDeviationPercent, "maxPairPriceDeviationPercent");
-      // Pair volumeUsd 的统计窗口和小额 pair 的聚合口径不稳定，仅作为日志观察；自动交易仍要求最少 swaps 与独立价格源交叉通过。
-      const marketHealthy = market.swaps >= parameters.config.market.minimumPairSwaps && priceDeviation <= maxDeviation;
+      const priceDeviation = market ? relativePriceDeviationPercent(current, parseDecimal(String(market.lastPrice), 18, "Pair lastPrice")) : null;
+      const maxDeviation = parsePercentage(parameters.config.market.maxPairPriceDeviationPercent, "maxPairPriceDeviationPercent");
+      // Pair volumeUsd 的统计窗口和小额 pair 的聚合口径不稳定，仅作为日志观察；active 策略仍要求最少 swaps 与独立价格源交叉通过。
+      const marketHealthy = market !== undefined && priceDeviation !== null && market.swaps >= parameters.config.market.minimumPairSwaps && priceDeviation <= maxDeviation;
       // 直接解析 sqrt 区间并按 API token decimals 恢复人类价格；先截断 rawPrice 会把 8/18 decimals 的窄区间压成同一个整数。
       const sqrtRange = parseConcentratedSqrtRange(strategy.strategyBytes);
       const display = convertAquaSqrtRangeToDisplayRange(strategy.tokens[0].address, strategy.tokens[0].decimals, strategy.tokens[1].address, strategy.tokens[1].decimals, sqrtRange);
       const oldRange = { ...display, current };
       const outside = outsideDistancePercent(current, oldRange); const excess = parsePercentage(parameters.config.rebalance.recenterExcess, "recenterExcess"); const observation = parameters.state.observations[key]; const prior = observation?.strategyHash === strategy.strategyHash ? observation : { strategyHash: strategy.strategyHash, breachCount: 0, lastShipAt: observation?.lastShipAt }; const breachCount = outside > excess ? prior.breachCount + 1 : 0; parameters.state.observations[key] = { ...prior, breachCount }; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
       const cooldownElapsed = !prior.lastShipAt || Date.now() - prior.lastShipAt >= parameters.config.rebalance.cooldownSeconds * 1000;
-      const decision = decideRebalance({ balances: { initial: [strategy.tokens[0].initialBalance.raw, strategy.tokens[1].initialBalance.raw], current: [strategy.tokens[0].currentBalance.raw, strategy.tokens[1].currentBalance.raw], usd: [strategy.tokens[0].currentBalance.usd, strategy.tokens[1].currentBalance.usd] }, currentPrice: current, oldRange, marketHealthy, stableBreach: breachCount >= parameters.config.polling.stableSnapshotsRequired, cooldownElapsed, recenterExcessPercent: excess, minValueRatioBps: parameters.config.rebalance.convertToTwoSidedMinValueRatioBps });
+      // illiquidity 不等待越界连续确认、冷却或 Pair 市场门槛；仍读取 current 来构造新价格区间，并保留所有 dock/ship 链上复核。
+      const illiquidityRehangReason = strategy.classification.state === "illiquidity" ? "策略状态=illiquidity，按当前钱包余额直接关闭并重新开仓" : undefined;
+      const decision = decideRebalance({ balances: { initial: [strategy.tokens[0].initialBalance.raw, strategy.tokens[1].initialBalance.raw], current: [strategy.tokens[0].currentBalance.raw, strategy.tokens[1].currentBalance.raw], usd: [strategy.tokens[0].currentBalance.usd, strategy.tokens[1].currentBalance.usd] }, currentPrice: current, oldRange, marketHealthy, stableBreach: breachCount >= parameters.config.polling.stableSnapshotsRequired, cooldownElapsed, recenterExcessPercent: excess, minValueRatioBps: parameters.config.rebalance.convertToTwoSidedMinValueRatioBps, forceRehangReason: illiquidityRehangReason });
       parameters.terminal?.upsert(dashboardRow(strategy, oldRange, outside, breachCount, parameters.config.polling.stableSnapshotsRequired, priceDeviation, decision));
-      parameters.logger.info(`监控 strategyHash=${strategy.strategyHash}，Pair volumeUsd=${market.volumeUsd}，swaps=${market.swaps}，Pair/EMSH 偏离=${formatFixed(priceDeviation)}%，越界=${formatFixed(outside)}%，连续=${breachCount}/${parameters.config.polling.stableSnapshotsRequired}，决定=${decision.action}，原因=${decision.reason}`); logRange(parameters.logger, strategy, oldRange, "旧策略区间");
+      const pairSummary = market ? `Pair volumeUsd=${market.volumeUsd}，swaps=${market.swaps}，Pair/EMSH 偏离=${formatFixed(priceDeviation ?? 0n)}%` : "Pair 市场未读取（illiquidity 直接重挂）";
+      parameters.logger.info(`监控 strategyHash=${strategy.strategyHash}，${pairSummary}，越界=${formatFixed(outside)}%，连续=${breachCount}/${parameters.config.polling.stableSnapshotsRequired}，决定=${decision.action}，原因=${decision.reason}`); logRange(parameters.logger, strategy, oldRange, "旧策略区间");
       if (decision.action === "rehang") { const plan = createPlan(strategy, decision.targetMode, current, parameters.config, oldRange, decision.reason); parameters.state.plans[key] = plan; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state); parameters.logger.info(`已生成自动计划：旧=${plan.sourceStrategyHash}，模式=${plan.targetMode}，新策略金额与 hash 将在 dock 确认后按钱包实际余额冻结，原因=${plan.decisionReason}`); await parameters.execute(plan); }
       if (decision.action === "block") parameters.logger.info(`阻止 strategyHash=${strategy.strategyHash}：${decision.reason}`);
     } catch (error) { const message = error instanceof Error ? error.message.split("\n")[0] : "未知错误"; parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：${message}`); }

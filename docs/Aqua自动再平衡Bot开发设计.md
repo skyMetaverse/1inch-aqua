@@ -159,7 +159,7 @@ API 分页无法确认完整
 {chainId}:{maker}:{app}:{sortedTokenAddress0}:{sortedTokenAddress1}:{strategyHash}
 ```
 
-每个 open 且受支持的 `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。`illiquidity` 是 1inch 策略 API 返回的分类标签，但当前 SDK、API 字段和已记录的真实响应均未给出可用于自动交易的正式语义；它会作为 open 策略在面板以 BLOCK 显示，不能被推断为“必然价格越界”或直接执行 `dock -> ship`。重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
+每个 open 且受支持的 `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。`illiquidity` 是 1inch 策略 API 返回的分类标签；按当前运营规则，它是直接关闭重开触发，不等待正常越界连续确认、冷却、Pair swaps 或 Pair/EMSH 价格交叉门槛。Bot 仍需读取有效 EMSH current 构造新区间，并完整执行 API/链上旧余额预检、dock receipt、钱包余额冻结、ship 模拟与 receipt/rawBalances 复核。重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
 
 ## 4. 默认策略参数
 
@@ -522,6 +522,6 @@ git diff --check
 2. Pair API 是否接受批量 pair，返回顺序是否与请求一一对应，及地址顺序是否强制规范排序。
 3. `lastPrice` 的时间语义，以及 Pair/EMSH 合理偏离阈值在高波动时是否需要调整。
 4. strategies API 新 ship 后的索引延迟分布。
-5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 open concentrated `active` 策略必须分别监控，不得按 pair 合并或跳过；`illiquidity` 等未确认状态也必须显示，而非静默遗漏。
+5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 open concentrated `active` 或 `illiquidity` 策略必须分别监控，不得按 pair 合并或跳过；`illiquidity` 直接触发关闭重开，其他未知状态仍必须显示，而非静默遗漏。
 
 真实返回与本文档冲突时，以真实行为为准，修正实现、测试、示例和本文档后再继续自动交易。

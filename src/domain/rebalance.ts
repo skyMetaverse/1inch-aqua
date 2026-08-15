@@ -44,6 +44,7 @@ export function relativePriceDeviationPercent(reference: bigint, compared: bigin
 
 /**
  * 输出唯一的重挂决策。市场门槛、连续越界和冷却由调用方先快照化后传入，避免领域层依赖时钟或网络。
+ * illiquidity 是 API 明确要求立即重挂的状态，因此跳过价格越界门槛，但新策略模式仍依据当前余额选择，不能假设旧单边方向仍有资金。
  * 单边部分成交后，接近等值优先转双边；未接近等值时只在需要重挂时保留 USD 较大一侧。
  */
 export function decideRebalance(input: {
@@ -55,16 +56,29 @@ export function decideRebalance(input: {
   cooldownElapsed: boolean;
   recenterExcessPercent: bigint;
   minValueRatioBps: number;
+  forceRehangReason?: string;
 }): RebalanceDecision {
   const sourceMode = classifySourceMode(input.balances.initial);
   if (!sourceMode) return { action: "block", reason: "策略初始两侧余额均为零，无法识别源模式" };
   if (input.balances.current.some((value) => value < 0n)) return { action: "block", reason: "策略当前 raw 余额不能为负数" };
   if (input.balances.current[0] === 0n && input.balances.current[1] === 0n) return { action: "block", reason: "策略当前两侧余额均为零" };
+
+  const bothCurrent = hasBothCurrentBalances(input.balances.current);
+  if (input.forceRehangReason) {
+    if (bothCurrent && sourceMode !== "two-sided" && isNearEqualUsd(input.balances.usd, input.minValueRatioBps)) {
+      return { action: "rehang", targetMode: "two-sided", reason: input.forceRehangReason };
+    }
+    if (bothCurrent) {
+      const targetMode: RebalanceMode = input.balances.usd[0] >= input.balances.usd[1] ? "upper" : "lower";
+      return { action: "rehang", targetMode, reason: input.forceRehangReason };
+    }
+    return { action: "rehang", targetMode: input.balances.current[0] > 0n ? "upper" : "lower", reason: input.forceRehangReason };
+  }
+
   // 成交量不再作为门槛；此处只在 Pair 最少 swaps 或 Pair/EMSH 交叉校验失败时阻止自动交易。
   if (!input.marketHealthy) return { action: "keep", reason: "Pair swaps 或价格交叉校验未通过，保持当前策略" };
   if (!input.cooldownElapsed) return { action: "keep", reason: "仍处于重挂冷却期" };
 
-  const bothCurrent = hasBothCurrentBalances(input.balances.current);
   if (sourceMode !== "two-sided" && bothCurrent && isNearEqualUsd(input.balances.usd, input.minValueRatioBps)) {
     return { action: "rehang", targetMode: "two-sided", reason: "单边部分成交后两侧 USD 价值已接近，切换为双边" };
   }
