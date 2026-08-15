@@ -44,7 +44,7 @@ function maskRpcUrl(value: string): string { try { const url = new URL(value); r
 function requireAddress(value: string, field: string): Address { if (!isAddress(value)) throw new Error(`${field} 不是有效 EVM 地址`); return value; }
 
 /**
- * 解释策略为何不能进入监控。官方请求使用 status=open，因此 concentrated 的 active 与 illiquidity 都是仍存在的可监控仓位；只有真实不匹配项才跳过。
+ * 解释策略为何不能进入自动处理。官方 status=open 会包含多种分类状态；illiquidity 的交易语义尚未由真实接口或 SDK 确认，必须保守阻止自动 dock/ship。
  */
 export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | "chainId" | "app" | "classification">, expectedMaker: Address, expectedChainId: number, expectedApp: Address): string | null {
   const reasons: string[] = [];
@@ -52,7 +52,7 @@ export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | 
   if (strategy.chainId !== expectedChainId) reasons.push(`chainId 不匹配：${strategy.chainId}`);
   if (strategy.app.toLowerCase() !== expectedApp.toLowerCase()) reasons.push(`app 不匹配：${strategy.app}`);
   if (strategy.classification.type !== "concentrated") reasons.push(`策略类型=${strategy.classification.type}，仅支持 concentrated`);
-  if (strategy.classification.state !== "active" && strategy.classification.state !== "illiquidity") reasons.push(`策略状态=${strategy.classification.state}，仅支持 active/illiquidity`);
+  if (strategy.classification.state !== "active") reasons.push(`策略状态=${strategy.classification.state}，当前仅自动处理 active；illiquidity 语义待确认`);
   return reasons.length > 0 ? reasons.join("；") : null;
 }
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }

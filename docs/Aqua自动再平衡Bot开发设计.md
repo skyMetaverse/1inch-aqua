@@ -11,7 +11,7 @@ Aqua 不会因价格源变化自动成交。成交必须由 resolver/taker 发�
 ### 1.1 第一版包含
 
 1. 常驻 `bun run rebalance-bot` 入口；运行后交互解密本地私钥并直接执行自动监控和重挂，不提供 `--dry-run`。
-2. 发现官方 API `status=open` 返回的当前 maker 全部仓位，并监控 concentrated 的 `active` 与 `illiquidity` 状态。
+2. 发现官方 API `status=open` 返回的当前 maker 全部仓位；自动处理 concentrated 的 `active` 状态，其他状态显示明确阻止原因。
 3. 通过官方策略 API 读取策略余额、USD 估值、策略成交量和手续费。
 4. 通过官方 Pair API 读取交易对市场活跃度。
 5. 通过官方 EMSH `current` API 获取用于精确计算区间的 current 价格。
@@ -133,7 +133,7 @@ RPC 不参与“是否重挂、重挂成什么模式”的业务决策，不按�
 
 ```text
 classification.type = concentrated
-classification.state = active 或 illiquidity
+classification.state = active
 chainId 与本地 RPC 一致
 maker 与解密私钥派生地址一致
 app 等于当前 SDK 支持的 Aqua SwapVM app
@@ -158,7 +158,7 @@ API 分页无法确认完整
 {chainId}:{maker}:{app}:{sortedTokenAddress0}:{sortedTokenAddress1}:{strategyHash}
 ```
 
-每个 open 且受支持的 `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。`illiquidity` 表示 concentrated open 仓位当前缺乏可用流动性，正是再平衡需要观察的状态，不能按“不支持”跳过；重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
+每个 open 且受支持的 `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。`illiquidity` 是 1inch 策略 API 返回的分类标签，但当前 SDK、API 字段和已记录的真实响应均未给出可用于自动交易的正式语义；它会作为 open 策略在面板以 BLOCK 显示，不能被推断为“必然价格越界”或直接执行 `dock -> ship`。重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
 
 ## 4. 默认策略参数
 
@@ -518,6 +518,6 @@ git diff --check
 2. Pair API 是否接受批量 pair，返回顺序是否与请求一一对应，及地址顺序是否强制规范排序。
 3. `lastPrice` 的时间语义，以及 Pair/EMSH 合理偏离阈值在高波动时是否需要调整。
 4. strategies API 新 ship 后的索引延迟分布。
-5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 open concentrated `active/illiquidity` 策略必须分别监控，不得按 pair 合并或跳过。
+5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 open concentrated `active` 策略必须分别监控，不得按 pair 合并或跳过；`illiquidity` 等未确认状态也必须显示，而非静默遗漏。
 
 真实返回与本文档冲突时，以真实行为为准，修正实现、测试、示例和本文档后再继续自动交易。

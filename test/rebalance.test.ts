@@ -1,6 +1,6 @@
 /**
  * 自动再平衡领域决策回归测试。
- * 核心功能：锁定 open concentrated 状态支持范围、单边部分成交转双边、持续越界重挂、冷却与市场门槛的安全行为。
+ * 核心功能：锁定 open 策略状态的保守自动处理边界、单边部分成交转双边、持续越界重挂、冷却与市场门槛的安全行为。
  * 主要流程：构造确定性余额和 1e18 价格区间 -> 调用纯函数 -> 断言唯一动作。
  */
 import { expect, test } from "bun:test";
@@ -13,11 +13,11 @@ const base = { currentPrice: FIXED_SCALE * 103n, oldRange: range, marketHealthy:
 const maker = "0x01162202AC4A4C686FE95B946E4833b8869CF961" as const;
 const app = "0x111111338c5091e8440b67b168bae16a668ac0de" as const;
 
-/** status=open 会返回 active 和 illiquidity；两者都必须进入监控，其他状态则给出精确原因。 */
-test("open concentrated 的 active 与 illiquidity 状态均受支持", () => {
+/** status=open 不是 active 的同义词；未确认交易语义的 illiquidity 必须明确展示并阻止自动交易。 */
+test("open concentrated 的 illiquidity 状态被保守阻止并说明原因", () => {
   const strategy = { maker, chainId: 1, app, classification: { type: "concentrated", state: "active", feePercent: 0.001 } };
   expect(unsupportedStrategyReason(strategy, maker, 1, app)).toBeNull();
-  expect(unsupportedStrategyReason({ ...strategy, classification: { ...strategy.classification, state: "illiquidity" } }, maker, 1, app)).toBeNull();
+  expect(unsupportedStrategyReason({ ...strategy, classification: { ...strategy.classification, state: "illiquidity" } }, maker, 1, app)).toContain("illiquidity 语义待确认");
   expect(unsupportedStrategyReason({ ...strategy, classification: { ...strategy.classification, state: "closed" } }, maker, 1, app)).toContain("策略状态=closed");
 });
 
