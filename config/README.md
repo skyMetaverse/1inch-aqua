@@ -68,6 +68,6 @@ bun run rebalance-bot config/rebalance.jsonc
 
 此命令没有 `--dry-run`：输入私钥解密密码后会持续监控，并在满足策略条件时直接广播 `dock`、必要授权和 `ship`。仅自动处理当前 SDK 的 `active concentrated` 两 token 策略；API `status=open` 返回的 `illiquidity` 会显示为 BLOCK，因其交易语义尚未确认而不自动交易。未知 app、API 分页未确认、市场数据异常或链上预检不一致时也会停止该仓位的自动处理并写中文日志。同一 pair 的多个 strategyHash 会作为独立仓位分别监控，不会互相跳过。交互终端显示原位刷新的对齐策略表和近期事件；所有关键价格和百分比完整显示，宽度不足时切换为多行详情；非 TTY、CI 或输出重定向自动回退为逐行日志。自动重挂仍按单个逻辑仓位持久化恢复，不把 dock 与 ship 合并为无法恢复的跨阶段 multicall。
 
-Bot 使用官方 `strategies/makers` API 发现仓位和决定当前余额形态，使用 Pair API 的最少 swaps 与价格交叉校验，使用 EMSH current 计算 5 bp 区间。`volumeUsd` 只输出到日志，不参与自动重挂门槛。RPC 不按区块轮询仓位，只在已决定重挂的交易前后做 rawBalances、模拟、事件和回执复核。运行状态写入配置指定的 `stateFile`，其中包含待恢复计划但不包含私钥、密码、Bearer token 或完整 RPC URL；v2 状态保存 decimals-aware sqrt 参数，v1 rawPrice 状态会被拒绝恢复。该文件与本地 `rebalance.jsonc` 均被 Git 忽略。
+Bot 使用官方 `strategies/makers` API 发现仓位和决定当前余额形态，使用 Pair API 的最少 swaps 与价格交叉校验，使用 EMSH current 计算 5 bp 区间。`volumeUsd` 只输出到日志，不参与自动重挂门槛。RPC 不按区块轮询仓位，只在已决定重挂的交易前后做 rawBalances、模拟、事件和回执复核。运行状态写入配置指定的 `stateFile`，其中包含待恢复计划但不包含私钥、密码、Bearer token 或完整 RPC URL；v2 状态保存 decimals-aware sqrt 参数，v1 rawPrice 状态会被拒绝恢复。Bot 运行时会创建同路径的 `.lock` 互斥文件；收到 `Ctrl+C`（SIGINT）或 SIGTERM 时自动释放。SIGKILL、断电或进程崩溃无法执行清理，只有确认没有 Bot 进程后才能人工删除遗留锁。状态文件、锁文件与本地 `rebalance.jsonc` 均被 Git 忽略。
 
 若 `dock` 已确认而 `ship` 因 RPC、余额、授权或合约状态变化失败，Bot 保留同一份计划并在下一轮优先恢复，不会生成第二个策略 hash 或悄悄修改投入金额。运行前应阅读 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。

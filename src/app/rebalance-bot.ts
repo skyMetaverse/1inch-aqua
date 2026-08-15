@@ -56,6 +56,31 @@ export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | 
   return reasons.length > 0 ? reasons.join("；") : null;
 }
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
+
+/** 以最小信号接口隔离 process，允许测试验证 Ctrl+C/服务停止会进入同一清理路径。 */
+export interface RebalanceTerminationSignalSource {
+  once(event: "SIGINT" | "SIGTERM", listener: (signal: string) => void): unknown;
+  off(event: "SIGINT" | "SIGTERM", listener: (signal: string) => void): unknown;
+}
+
+/**
+ * 注册可移除的终止处理器。共享 completed 标记是为处理用户连续按 Ctrl+C 或运行环境同时发送 SIGTERM，防止重复释放同一个锁文件。
+ * SIGKILL 不可被用户态捕获，仍只能在确认 Bot 已停止后人工清理遗留锁。
+ */
+export function installRebalanceTerminationHandler(source: RebalanceTerminationSignalSource, onTerminate: (signal: string) => void): () => void {
+  let completed = false;
+  const handler = (signal: string): void => {
+    if (completed) return;
+    completed = true;
+    onTerminate(signal);
+  };
+  source.once("SIGINT", handler);
+  source.once("SIGTERM", handler);
+  return (): void => {
+    source.off("SIGINT", handler);
+    source.off("SIGTERM", handler);
+  };
+}
 function positionIdentity(strategy: Pick<LogicalPositionInput, "chainId" | "maker" | "app" | "tokens">): string { return `${strategy.chainId}:${strategy.maker.toLowerCase()}:${strategy.app.toLowerCase()}:${[strategy.tokens[0].address, strategy.tokens[1].address].map((value) => value.toLowerCase()).sort().join(":")}`; }
 function marketKey(tokens: [{ address: Address }, { address: Address }]): string { return `${tokens[0].address.toLowerCase()}:${tokens[1].address.toLowerCase()}`; }
 
@@ -320,6 +345,23 @@ async function main(): Promise<void> {
   logger.info(`启动自动再平衡 Bot：配置=${configPath}，chainId=${config.chainId}，日志=${logger.filePath}`);
   let release: (() => void) | undefined;
   let privateKey: Buffer | undefined;
+  let cleaned = false;
+  /** 正常返回、异常和可捕获终止信号共用此清理函数，确保锁与敏感内存恰好处理一次。 */
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    privateKey?.fill(0);
+    release?.();
+    terminal.close();
+  };
+  const removeTerminationHandler = installRebalanceTerminationHandler(process, (signal) => {
+    try {
+      logger.info(`收到 ${signal}，正在安全释放自动再平衡 Bot 资源`);
+    } finally {
+      cleanup();
+      process.exit(0);
+    }
+  });
   try {
     release = acquireRebalanceLock(config.runtime.stateFile);
     const rpcUrl = readRpcUrl();
@@ -371,6 +413,9 @@ async function main(): Promise<void> {
       }
       await sleep(config.polling.intervalSeconds * 1000);
     }
-  } finally { privateKey?.fill(0); release?.(); terminal.close(); }
+  } finally {
+    removeTerminationHandler();
+    cleanup();
+  }
 }
 if (import.meta.main) main().catch((error: unknown) => { const message = error instanceof Error ? error.message.split("\n")[0] : "未知错误"; if (activeLogger) activeLogger.info(`自动再平衡 Bot 退出：${message}`); else process.stderr.write(`${formatLogLine(`自动再平衡 Bot 退出：${message}`)}\n`); activeTerminal?.close(); process.exitCode = 1; });

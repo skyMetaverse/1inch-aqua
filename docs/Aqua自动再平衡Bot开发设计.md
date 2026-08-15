@@ -234,7 +234,7 @@ config/rebalance.jsonc
 - `minimumPairSwaps`：Pair API 的 swaps 低于该阈值时不自动重挂。Pair `volumeUsd` 因统计窗口和小额 pair 聚合口径不稳定，仅记录到日志，不参与自动交易门槛。
 - `maxPairPriceDeviationPercent`：EMSH current 与 Pair `lastPrice` 偏离超过阈值时停止自动交易，记录两源价格冲突。实测 `1INCH/UNI` 的两者可正常相差约 `0.30%`，因为接口语义不同；默认使用 `1%` 作为异常熔断，而不是误用 5 bp 要求两者一致。
 - `convertToTwoSidedMinValueRatioBps=8000`：小侧 USD 至少为大侧 USD 的 80% 时视为接近等值。
-- `stateFile`：持久化状态，仅用于幂等恢复与计划生命周期，绝不替代 API 形成业务决策。
+- `stateFile`：持久化状态，仅用于幂等恢复与计划生命周期，绝不替代 API 形成业务决策；同路径 `.lock` 用于阻止第二个 Bot 进程并发操作同一份计划。
 
 每个 `currentBalance.raw` 必须是非负十进制整数字符串。`usd` 必须为有限、非负 number；缺失、NaN、Infinity、负数或值为零时按对应规则阻止自动执行。
 
@@ -359,7 +359,7 @@ shipStrategyHash?
 shipTransactionHash?
 ```
 
-写入必须使用“写临时文件 -> fsync -> 原子 rename”流程，避免进程崩溃留下半个 JSON。状态文件权限必须限制为当前用户；不包含私钥、密码、Bearer token 或完整 RPC URL。
+写入必须使用“写临时文件 -> fsync -> 原子 rename”流程，避免进程崩溃留下半个 JSON。状态文件权限必须限制为当前用户；不包含私钥、密码、Bearer token 或完整 RPC URL。Bot 运行时以排他方式创建 `${stateFile}.lock`；`SIGINT`（Ctrl+C）和 `SIGTERM` 的处理器会同步释放该锁、清除内存私钥并恢复终端。SIGKILL、断电或进程崩溃无法运行用户态清理逻辑，只有确认没有运行中的 Bot 后才能人工删除遗留锁。
 
 状态格式为 v2，计划持久化的是 decimals-aware `targetSqrtPriceMin/Max`，而不是截断的 raw price。v1 状态文件可能包含 mixed-decimals 的错误报价，Bot 必须拒绝自动恢复；调用方应先人工核对链上状态并归档旧文件，不能把 v1 raw 参数迁移后直接广播。
 
