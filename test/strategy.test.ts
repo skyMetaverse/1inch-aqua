@@ -1,7 +1,7 @@
 /**
  * Aqua 策略构建回归测试。
- * 核心功能：验证 Bun 运行时可以加载 SwapVM SDK，且 0.001% 费率与随机 salt 能生成不同的可 ship 策略。
- * 主要流程：使用公开地址和固定精确价格构建两次策略 -> 校验交易目标、hash 格式与策略唯一性。
+ * 核心功能：验证 Bun 运行时可以加载 SwapVM SDK，并锁定随机与固定资金快照下的 strategy hash 行为。
+ * 主要流程：使用公开地址和固定精确价格构建策略 -> 校验交易目标、hash 格式、随机唯一性与恢复确定性。
  */
 import { expect, test } from "bun:test";
 import { parseConcentratedSqrtRange } from "../src/aqua/strategy-parser.ts";
@@ -48,4 +48,32 @@ test("sqrtPrice 参数可构建 mixed-decimals 集中流动性策略", () => {
   const decoded = parseConcentratedSqrtRange(strategy.strategy);
   expect(decoded.sqrtPriceMin).toBe(11_516_882_336n);
   expect(decoded.sqrtPriceMax).toBe(11_520_338_956n);
+});
+
+/** dock 后冻结相同余额和 salt 必须重建相同策略；金额不参与 strategyHash，但会改变 ship calldata，因此恢复仍须锁定金额。 */
+test("固定钱包资金快照可确定性重建策略并锁定 ship calldata", () => {
+  const base = {
+    chainId: 1,
+    maker: "0x01162202AC4A4C686FE95B946E4833b8869CF961" as const,
+    sqrtPriceMin: 11_516_882_336n,
+    sqrtPriceMax: 11_520_338_956n,
+    feeValue: 10_000n,
+    salt: 987_654n,
+  };
+  const first = buildConcentratedStrategy({ ...base, amounts: [
+    { token: "0x111111111117dc0aa78b770fa6a738034120c302" as const, amount: 123n },
+    { token: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" as const, amount: 456n },
+  ] });
+  const restored = buildConcentratedStrategy({ ...base, amounts: [
+    { token: "0x111111111117dc0aa78b770fa6a738034120c302" as const, amount: 123n },
+    { token: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" as const, amount: 456n },
+  ] });
+  const changedBalance = buildConcentratedStrategy({ ...base, amounts: [
+    { token: "0x111111111117dc0aa78b770fa6a738034120c302" as const, amount: 124n },
+    { token: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" as const, amount: 456n },
+  ] });
+  expect(restored.strategyHash).toBe(first.strategyHash);
+  expect(restored.ship.data).toBe(first.ship.data);
+  expect(changedBalance.strategyHash).toBe(first.strategyHash);
+  expect(changedBalance.ship.data).not.toBe(first.ship.data);
 });

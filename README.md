@@ -130,7 +130,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-Bot 只自动处理当前 SDK 支持的两 token concentrated `active` 策略；API 返回的其他 open 状态（包括 `illiquidity`）会显示为 BLOCK 并写入明确原因，不会自动交易。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含完整 current、完整旧区间、完整越界、连续次数、完整 Pair/EMSH 价差和决策状态；宽度不足时自动改用逐策略多行详情，关键数值绝不以省略号截断。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，不能在未人工审计的情况下恢复自动交易。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+Bot 只自动处理当前 SDK 支持的两 token concentrated `active` 策略；API 返回的其他 open 状态（包括 `illiquidity`）会显示为 BLOCK 并写入明确原因，不会自动交易。API 的 `currentBalance.raw` 只用于 dock 前核对旧策略；dock 已确认后，Bot 会读取该 pair 两个 token 的实际钱包余额并冻结新策略资金：双边全额投入两侧钱包余额，单边只全额投入目标侧余额。因此钱包中同 token 的既有资产也会被纳入本次重挂，非目标侧单边余额会保留在钱包。冻结金额、salt 与新 hash 写入 state v3 后，即使余额随后变化也不会修改同一计划。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含完整 current、完整旧区间、完整越界、连续次数、完整 Pair/EMSH 价差和决策状态；宽度不足时自动改用逐策略多行详情，关键数值绝不以省略号截断。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，v2 未发 ship 计划会升级为 v3 并在 dock 后重新冻结钱包余额。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
 
 运行回归测试：
 

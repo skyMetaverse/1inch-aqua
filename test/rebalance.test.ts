@@ -4,7 +4,7 @@
  * 主要流程：构造确定性余额和 1e18 价格区间 -> 调用纯函数 -> 断言唯一动作。
  */
 import { expect, test } from "bun:test";
-import { buildLogicalPositionKey, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
+import { buildLogicalPositionKey, deriveWalletShipAmounts, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
 import { decideRebalance, isNearEqualUsd, outsideDistancePercent } from "../src/domain/rebalance.ts";
 import { FIXED_SCALE, parsePercentage } from "../src/domain/fixed.ts";
 
@@ -19,6 +19,16 @@ test("open concentrated 的 illiquidity 状态被保守阻止并说明原因", (
   expect(unsupportedStrategyReason(strategy, maker, 1, app)).toBeNull();
   expect(unsupportedStrategyReason({ ...strategy, classification: { ...strategy.classification, state: "illiquidity" } }, maker, 1, app)).toContain("illiquidity 语义待确认");
   expect(unsupportedStrategyReason({ ...strategy, classification: { ...strategy.classification, state: "closed" } }, maker, 1, app)).toContain("策略状态=closed");
+});
+
+/** dock 确认后必须用钱包完整余额决定新策略投入，而不是继续使用旧策略 API 虚拟余额。 */
+test("按目标模式从实际钱包余额导出全额 ship 金额", () => {
+  const wallet: [bigint, bigint] = [123n, 456n];
+  expect(deriveWalletShipAmounts(wallet, "upper")).toEqual([123n, 0n]);
+  expect(deriveWalletShipAmounts(wallet, "lower")).toEqual([0n, 456n]);
+  expect(deriveWalletShipAmounts(wallet, "two-sided")).toEqual([123n, 456n]);
+  expect(() => deriveWalletShipAmounts([0n, 456n], "upper")).toThrow("token0 余额为零");
+  expect(() => deriveWalletShipAmounts([123n, 0n], "two-sided")).toThrow("两侧余额必须均大于零");
 });
 
 test("同一 pair 的不同 strategyHash 使用独立逻辑仓位 key", () => {

@@ -112,7 +112,23 @@ function migrateStateKeys(state: StateDocument): boolean {
 }
 function parseBotArguments(): string { const args = process.argv.slice(2); if (args.includes("--help") || args.includes("-h")) { process.stdout.write("用法：bun run rebalance-bot [配置文件路径]\n"); process.stdout.write(`默认配置文件：${DEFAULT_CONFIG_PATH}\n`); process.stdout.write("运行后会持续监控并直接执行符合条件的 dock/ship，不提供 dry-run。\n"); process.exit(0); } if (args.length > 1 || args.some((item) => item.startsWith("-"))) throw new Error("用法：bun run rebalance-bot [配置文件路径]"); return args[0] ?? DEFAULT_CONFIG_PATH; }
 function currentTimestampValid(timestamp: number, maximumAge: number): void { const now = Math.floor(Date.now() / 1000); if (timestamp > now + 60 || now - timestamp > maximumAge) throw new Error(`EMSH current 时间戳无效或过期：timestamp=${timestamp}`); }
-function planAmounts(strategy: ApiStrategy, mode: RebalanceMode): [bigint, bigint] { const current: [bigint, bigint] = [strategy.tokens[0].currentBalance.raw, strategy.tokens[1].currentBalance.raw]; if (mode === "two-sided") { if (current[0] === 0n || current[1] === 0n) throw new Error("双边计划要求 API 两侧 currentBalance.raw 均大于零"); return current; } if (mode === "upper") { if (current[0] === 0n) throw new Error("上单边计划缺少 token0 余额"); return [current[0], 0n]; } if (current[1] === 0n) throw new Error("下单边计划缺少 token1 余额"); return [0n, current[1]]; }
+/**
+ * 按已决定的模式从 dock 后钱包快照导出最终 ship 金额。决策模式来自 API，资金规模则必须来自钱包实际余额，避免忽略钱包中可用的同 pair 资产。
+ * 单边刻意保留非目标侧在钱包中；双边要求两个实际余额均非零，不能静默降级为单边。
+ */
+export function deriveWalletShipAmounts(walletBalances: [bigint, bigint], mode: RebalanceMode): [bigint, bigint] {
+  if (walletBalances.some((value) => value < 0n)) throw new Error("钱包 raw 余额不能为负数");
+  if (mode === "upper") {
+    if (walletBalances[0] === 0n) throw new Error("上单边重挂时钱包 token0 余额为零");
+    return [walletBalances[0], 0n];
+  }
+  if (mode === "lower") {
+    if (walletBalances[1] === 0n) throw new Error("下单边重挂时钱包 token1 余额为零");
+    return [0n, walletBalances[1]];
+  }
+  if (walletBalances[0] === 0n || walletBalances[1] === 0n) throw new Error("双边重挂时钱包两侧余额必须均大于零");
+  return walletBalances;
+}
 function displayRangeForMode(current: bigint, mode: RebalanceMode, config: RebalanceConfig) { const width = mode === "two-sided" ? parsePercentage(config.rebalance.twoSidedHalfWidth, "twoSidedHalfWidth") : parsePercentage(config.rebalance.singleSidedWidth, "singleSidedWidth"); return calculateDisplayRange(current, mode, mode === "lower" ? undefined : width, mode === "upper" ? undefined : width); }
 function updatePlan(state: StateDocument, plan: PersistedPlan, config: RebalanceConfig): void { state.plans[plan.logicalPositionKey] = plan; saveRebalanceState(config.runtime.stateFile, state); }
 
@@ -194,7 +210,7 @@ async function oldStrategyDocked(client: ReturnType<typeof createPublicClient>, 
 }
 
 /** 判断持久化新 hash 是否已完整 ship；恢复 SHIP_SENT 时只要成立便完成，不会重发。 */
-async function newStrategyShipped(client: ReturnType<typeof createPublicClient>, registry: Address, account: Address, app: Address, plan: PersistedPlan): Promise<boolean> {
+async function newStrategyShipped(client: ReturnType<typeof createPublicClient>, registry: Address, account: Address, app: Address, plan: FrozenShipPlan): Promise<boolean> {
   for (const [index, token] of plan.tokens.entries()) {
     const result = await client.readContract({ address: registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [account, app, plan.shipStrategyHash as Hex, requireAddress(token, "计划 token")] }) as unknown as readonly [bigint, number];
     if (result[0] !== BigInt(plan.targetAmountsRaw[index] ?? "") || result[1] !== 2) return false;
@@ -207,7 +223,7 @@ function hasEvent(logs: ReadonlyArray<{ address: Address; data: Hex; topics: rea
 }
 
 /** ship 恢复与正常路径都必须确认每个非零投入 token 的 Pushed 事件。 */
-function verifyPushedEvents(logs: ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>, registry: Address, maker: Address, app: Address, strategyHash: Hex, plan: PersistedPlan): void {
+function verifyPushedEvents(logs: ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>, registry: Address, maker: Address, app: Address, strategyHash: Hex, plan: FrozenShipPlan): void {
   const topic = PushedEvent.TOPIC.toString().toLowerCase();
   for (const [index, token] of plan.tokens.entries()) {
     const expected = BigInt(plan.targetAmountsRaw[index] ?? "");
@@ -219,7 +235,7 @@ function verifyPushedEvents(logs: ReadonlyArray<{ address: Address; data: Hex; t
 
 /** 按已持久化计划关闭旧策略；阶段在广播前写入，重启时可用 rawBalances 判断是否已落链。 */
 async function executeDock(parameters: { plan: PersistedPlan; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; registry: Address; account: PrivateKeyAccount; chain: Chain; rpcUrl: string; logger: Logger }): Promise<PersistedPlan> {
-  let { plan } = parameters; if (plan.stage === "DOCK_VERIFIED" || plan.stage === "SHIP_SENT" || plan.stage === "ACTIVE_LATEST") return plan;
+  let { plan } = parameters; if (plan.stage === "DOCK_VERIFIED" || plan.stage === "SHIP_PREPARED" || plan.stage === "SHIP_SENT" || plan.stage === "ACTIVE_LATEST") return plan;
   const storedHash = AquaProtocolContract.calculateStrategyHash(new HexString(plan.sourceStrategyBytes)).toString();
   if (storedHash.toLowerCase() !== plan.sourceStrategyHash.toLowerCase()) throw new Error("持久化计划的 sourceStrategyBytes hash 不一致");
   if (plan.stage === "DOCK_SENT") {
@@ -245,47 +261,107 @@ async function executeDock(parameters: { plan: PersistedPlan; state: StateDocume
   plan = { ...plan, stage: "DOCK_VERIFIED", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`dock 已确认并复核：strategyHash=${plan.sourceStrategyHash}`); return plan;
 }
 
-/** 以持久化 salt 和精确 sqrt 参数构建新策略，确保恢复过程不会产生第二个 hash 或丢失 mixed-decimals 区间。 */
-function buildPlanStrategy(plan: PersistedPlan, chainId: number, maker: Address) {
-  const built = buildConcentratedStrategy({ chainId, maker, sqrtPriceMin: BigInt(plan.targetSqrtPriceMin), sqrtPriceMax: BigInt(plan.targetSqrtPriceMax), feeValue: percentageToAquaFeeValue(parsePercentage(plan.fee, "计划 fee")), amounts: [{ token: requireAddress(plan.tokens[0], "计划 token0"), amount: BigInt(plan.targetAmountsRaw[0]) }, { token: requireAddress(plan.tokens[1], "计划 token1"), amount: BigInt(plan.targetAmountsRaw[1]) }], salt: BigInt(plan.salt) });
-  if (built.strategyHash.toLowerCase() !== plan.shipStrategyHash.toLowerCase()) throw new Error("持久化计划的 ship strategyHash 与重建结果不一致"); return built;
+type FrozenShipPlan = PersistedPlan & { targetAmountsRaw: [string, string]; salt: string; shipStrategyHash: string };
+
+/** 只有 SHIP_PREPARED 后才允许使用新策略字段；恢复时不重新读取钱包来改变已冻结的金额或 hash。 */
+function requireFrozenShipPlan(plan: PersistedPlan): FrozenShipPlan {
+  if (!plan.targetAmountsRaw || !plan.salt || !plan.shipStrategyHash) throw new Error(`计划阶段=${plan.stage} 缺少已冻结的 ship 金额、salt 或 strategyHash`);
+  return plan as FrozenShipPlan;
 }
 
-/** ship 前仅按计划金额读取钱包余额与 allowance；不因链上读数改变已批准的 API 决策。 */
+/** 以持久化 salt、实际钱包快照金额和精确 sqrt 参数构建新策略，确保恢复过程不会产生第二个 hash。 */
+function buildPlanStrategy(plan: FrozenShipPlan, chainId: number, maker: Address) {
+  const built = buildConcentratedStrategy({ chainId, maker, sqrtPriceMin: BigInt(plan.targetSqrtPriceMin), sqrtPriceMax: BigInt(plan.targetSqrtPriceMax), feeValue: percentageToAquaFeeValue(parsePercentage(plan.fee, "计划 fee")), amounts: [{ token: requireAddress(plan.tokens[0], "计划 token0"), amount: BigInt(plan.targetAmountsRaw[0]) }, { token: requireAddress(plan.tokens[1], "计划 token1"), amount: BigInt(plan.targetAmountsRaw[1]) }], salt: BigInt(plan.salt) });
+  if (built.strategyHash.toLowerCase() !== plan.shipStrategyHash.toLowerCase()) throw new Error("持久化计划的 ship strategyHash 与重建结果不一致");
+  return built;
+}
+
+/**
+ * dock 已确认后读取该 pair 的两个实际钱包余额，并在任何 approve、模拟或广播前原子冻结最终金额、salt 与 hash。
+ * SHIP_PREPARED 后即使用户转入更多代币也不再改变本次策略，确保恢复只会重建同一个 strategyHash。
+ */
+async function prepareShipFromWallet(parameters: { plan: PersistedPlan; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; registry: Address; account: PrivateKeyAccount; chainId: number; logger: Logger }): Promise<PersistedPlan> {
+  if (parameters.plan.stage !== "DOCK_VERIFIED") return parameters.plan;
+  const token0 = requireAddress(parameters.plan.tokens[0], "计划 token0");
+  const token1 = requireAddress(parameters.plan.tokens[1], "计划 token1");
+  // 保持串行读取，沿用低额度 RPC 的限流保护；这两个余额是新策略唯一的资金来源快照。
+  const state0 = await readTokenState(parameters.client, token0, parameters.account.address, parameters.registry);
+  const state1 = await readTokenState(parameters.client, token1, parameters.account.address, parameters.registry);
+  const walletBalances: [bigint, bigint] = [state0.balance, state1.balance];
+  const amounts = deriveWalletShipAmounts(walletBalances, parameters.plan.targetMode);
+  const salt = BigInt(`0x${randomBytes(8).toString("hex")}`);
+  const built = buildConcentratedStrategy({ chainId: parameters.chainId, maker: parameters.account.address, sqrtPriceMin: BigInt(parameters.plan.targetSqrtPriceMin), sqrtPriceMax: BigInt(parameters.plan.targetSqrtPriceMax), feeValue: percentageToAquaFeeValue(parsePercentage(parameters.plan.fee, "计划 fee")), amounts: [{ token: token0, amount: amounts[0] }, { token: token1, amount: amounts[1] }], salt });
+  if (built.registry.toLowerCase() !== parameters.registry.toLowerCase()) throw new Error("新策略 registry 与 RPC 网络不一致");
+  const now = Date.now();
+  const prepared: PersistedPlan = { ...parameters.plan, walletBalancesRaw: [walletBalances[0].toString(), walletBalances[1].toString()], targetAmountsRaw: [amounts[0].toString(), amounts[1].toString()], walletSnapshotAt: now, salt: salt.toString(), shipStrategyHash: built.strategyHash, shipFundingSource: "WALLET_SNAPSHOT", stage: "SHIP_PREPARED", updatedAt: now };
+  updatePlan(parameters.state, prepared, parameters.config);
+  parameters.logger.info(`dock 后钱包余额已冻结：strategyHash=${prepared.sourceStrategyHash}，token0=${token0} raw=${walletBalances[0].toString()}，token1=${token1} raw=${walletBalances[1].toString()}，模式=${prepared.targetMode}，ship token0 raw=${amounts[0].toString()}，ship token1 raw=${amounts[1].toString()}，salt=${prepared.salt}，新策略=${prepared.shipStrategyHash}`);
+  return prepared;
+}
+
+/** ship 仅使用 SHIP_PREPARED 已冻结的钱包金额；再次读取钱包只验证余额和 allowance，不能改变计划投入额。 */
 async function executeShip(parameters: { plan: PersistedPlan; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; registry: Address; account: PrivateKeyAccount; chain: Chain; chainId: number; rpcUrl: string; logger: Logger }): Promise<PersistedPlan> {
-  let { plan } = parameters; if (plan.stage === "ACTIVE_LATEST") return plan;
-  const built = buildPlanStrategy(plan, parameters.chainId, parameters.account.address); if (built.registry.toLowerCase() !== parameters.registry.toLowerCase()) throw new Error("新策略 registry 与 RPC 网络不一致");
-  if (plan.stage === "SHIP_SENT") {
-    if (!plan.shipTransactionHash) throw new Error("恢复 ship 计划缺少交易哈希，已停止避免重复广播");
-    const receipt = await parameters.client.waitForTransactionReceipt({ hash: plan.shipTransactionHash as Hex, confirmations: 1 });
-    if (receipt.status !== "success") throw new Error(`恢复 ship 回执失败：${plan.shipTransactionHash}`);
+  let { plan } = parameters;
+  if (plan.stage === "ACTIVE_LATEST") return plan;
+  plan = await prepareShipFromWallet(parameters);
+  if (plan.stage !== "SHIP_PREPARED" && plan.stage !== "SHIP_SENT") throw new Error(`ship 要求计划处于 SHIP_PREPARED 或 SHIP_SENT，实际=${plan.stage}`);
+  const frozen = requireFrozenShipPlan(plan);
+  const built = buildPlanStrategy(frozen, parameters.chainId, parameters.account.address);
+  if (built.registry.toLowerCase() !== parameters.registry.toLowerCase()) throw new Error("新策略 registry 与 RPC 网络不一致");
+  if (frozen.stage === "SHIP_SENT") {
+    if (!frozen.shipTransactionHash) throw new Error("恢复 ship 计划缺少交易哈希，已停止避免重复广播");
+    const receipt = await parameters.client.waitForTransactionReceipt({ hash: frozen.shipTransactionHash as Hex, confirmations: 1 });
+    if (receipt.status !== "success") throw new Error(`恢复 ship 回执失败：${frozen.shipTransactionHash}`);
     const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>;
     if (!hasEvent(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, "shipped")) throw new Error("恢复 ship 回执缺少匹配 Shipped 事件");
-    verifyPushedEvents(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, plan);
-    if (!await newStrategyShipped(parameters.client, parameters.registry, parameters.account.address, built.app, plan)) throw new Error("恢复 ship 后链上余额与计划不一致");
-    registerCompletedObservation(parameters.state, plan, built.strategyHash, parameters.config); parameters.logger.info(`恢复 ship 成功：strategyHash=${built.strategyHash}`); return plan;
+    verifyPushedEvents(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, frozen);
+    if (!await newStrategyShipped(parameters.client, parameters.registry, parameters.account.address, built.app, frozen)) throw new Error("恢复 ship 后链上余额与计划不一致");
+    registerCompletedObservation(parameters.state, frozen, built.strategyHash, parameters.config);
+    parameters.logger.info(`恢复 ship 成功：strategyHash=${built.strategyHash}`);
+    return frozen;
   }
-  for (const [index, token] of plan.tokens.entries()) { const amount = BigInt(plan.targetAmountsRaw[index] ?? ""); if (amount === 0n) continue; const tokenState = await readTokenState(parameters.client, requireAddress(token, "计划 token"), parameters.account.address, parameters.registry); if (tokenState.balance < amount) throw new Error(`钱包余额不足以恢复计划：token=${token}，余额=${tokenState.balance.toString()}，计划=${amount.toString()}`); await ensureMaximumAllowance({ publicClient: parameters.client, account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, token: requireAddress(token, "计划 token"), registry: parameters.registry, initialAllowance: tokenState.allowance, requiredAmount: amount, dryRun: false, logger: parameters.logger }); }
-  await parameters.client.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value }); parameters.logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);
-  plan = { ...plan, stage: "SHIP_SENT", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config);
-  const transactionHash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), built.ship); plan = { ...plan, shipTransactionHash: transactionHash, updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`ship 已广播：strategyHash=${built.strategyHash}，交易哈希=${transactionHash}`);
-  const receipt = await parameters.client.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 }); if (receipt.status !== "success") throw new Error(`ship 回执失败：${transactionHash}`);
-  const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>; if (!hasEvent(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, "shipped")) throw new Error("ship 回执缺少匹配 Shipped 事件");
-  verifyPushedEvents(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, plan);
-  for (const [index, token] of plan.tokens.entries()) { const expected = BigInt(plan.targetAmountsRaw[index] ?? ""); const result = await parameters.client.readContract({ address: parameters.registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [parameters.account.address, built.app, built.strategyHash, requireAddress(token, "计划 token")] }) as unknown as readonly [bigint, number]; if (result[0] !== expected || result[1] !== 2) throw new Error(`ship 后链上余额复核失败：token=${token}`); }
-  registerCompletedObservation(parameters.state, plan, built.strategyHash, parameters.config); parameters.logger.info(`自动重挂完成：旧=${plan.sourceStrategyHash}，新=${built.strategyHash}`); return plan;
+  for (const [index, token] of frozen.tokens.entries()) {
+    const amount = BigInt(frozen.targetAmountsRaw[index] ?? "");
+    if (amount === 0n) continue;
+    const tokenState = await readTokenState(parameters.client, requireAddress(token, "计划 token"), parameters.account.address, parameters.registry);
+    if (tokenState.balance < amount) throw new Error(`钱包余额不足以执行已冻结计划：token=${token}，余额=${tokenState.balance.toString()}，计划=${amount.toString()}`);
+    await ensureMaximumAllowance({ publicClient: parameters.client, account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, token: requireAddress(token, "计划 token"), registry: parameters.registry, initialAllowance: tokenState.allowance, requiredAmount: amount, dryRun: false, logger: parameters.logger });
+  }
+  parameters.logger.info(`ship 使用已冻结的 dock 后钱包快照：strategyHash=${built.strategyHash}，token0 raw=${frozen.targetAmountsRaw[0]}，token1 raw=${frozen.targetAmountsRaw[1]}`);
+  await parameters.client.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value });
+  parameters.logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);
+  plan = { ...frozen, stage: "SHIP_SENT", updatedAt: Date.now() };
+  updatePlan(parameters.state, plan, parameters.config);
+  const transactionHash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), built.ship);
+  plan = { ...plan, shipTransactionHash: transactionHash, updatedAt: Date.now() };
+  updatePlan(parameters.state, plan, parameters.config);
+  parameters.logger.info(`ship 已广播：strategyHash=${built.strategyHash}，交易哈希=${transactionHash}`);
+  const receipt = await parameters.client.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 });
+  if (receipt.status !== "success") throw new Error(`ship 回执失败：${transactionHash}`);
+  const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>;
+  if (!hasEvent(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, "shipped")) throw new Error("ship 回执缺少匹配 Shipped 事件");
+  const shipped = requireFrozenShipPlan(plan);
+  verifyPushedEvents(logs, parameters.registry, parameters.account.address, built.app, built.strategyHash, shipped);
+  for (const [index, token] of shipped.tokens.entries()) {
+    const expected = BigInt(shipped.targetAmountsRaw[index] ?? "");
+    const result = await parameters.client.readContract({ address: parameters.registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [parameters.account.address, built.app, built.strategyHash as Hex, requireAddress(token, "计划 token")] }) as unknown as readonly [bigint, number];
+    if (result[0] !== expected || result[1] !== 2) throw new Error(`ship 后链上余额复核失败：token=${token}`);
+  }
+  registerCompletedObservation(parameters.state, shipped, built.strategyHash, parameters.config);
+  parameters.logger.info(`自动重挂完成：旧=${shipped.sourceStrategyHash}，新=${built.strategyHash}`);
+  return shipped;
 }
 
-/** 从一次 API/市场快照构造计划，计划中冻结 API raw 余额和随机 salt，后续不再修改策略参数。 */
-function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint, config: RebalanceConfig, account: Address, oldRange: { min: bigint; max: bigint }, reason: string): PersistedPlan {
+/**
+ * 从一次 API/市场快照构造 dock 计划。API currentBalance.raw 只冻结为旧策略链上核验基准，绝不作为新策略投入额。
+ * 新策略金额、salt 与 hash 必须等 dock 已确认后，以钱包真实余额在 SHIP_PREPARED 阶段一次性冻结。
+ */
+function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint, config: RebalanceConfig, oldRange: { min: bigint; max: bigint }, reason: string): PersistedPlan {
   const range = displayRangeForMode(current, mode, config);
   // API 的 decimals 是策略元数据的一部分；缺失或漂移已在 API 适配层拒绝，不能退化为 rawPrice 重挂。
   const aquaRange = convertDisplayRangeToAquaSqrtRange(strategy.tokens[0].address, strategy.tokens[0].decimals, strategy.tokens[1].address, strategy.tokens[1].decimals, range);
-  const amounts = planAmounts(strategy, mode);
-  const salt = BigInt(`0x${randomBytes(8).toString("hex")}`);
-  const built = buildConcentratedStrategy({ chainId: strategy.chainId, maker: account, sqrtPriceMin: aquaRange.sqrtPriceMin, sqrtPriceMax: aquaRange.sqrtPriceMax, feeValue: percentageToAquaFeeValue(parsePercentage(config.rebalance.fee, "rebalance.fee")), amounts: [{ token: strategy.tokens[0].address, amount: amounts[0] }, { token: strategy.tokens[1].address, amount: amounts[1] }], salt });
   const now = Date.now();
-  return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetAmountsRaw: [amounts[0].toString(), amounts[1].toString()], targetSqrtPriceMin: aquaRange.sqrtPriceMin.toString(), targetSqrtPriceMax: aquaRange.sqrtPriceMax.toString(), fee: config.rebalance.fee, salt: salt.toString(), shipStrategyHash: built.strategyHash, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED" };
+  return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetSqrtPriceMin: aquaRange.sqrtPriceMin.toString(), targetSqrtPriceMax: aquaRange.sqrtPriceMax.toString(), fee: config.rebalance.fee, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED" };
 }
 
 /** 每轮处理 API 返回的完整仓位集合；每个 strategyHash 都是独立仓位，同 pair 不再互相跳过。 */
@@ -306,7 +382,7 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
   for (const strategy of supported) {
     const key = logicalKey(strategy); const existingPlan = parameters.state.plans[key];
     if (existingPlan && existingPlan.stage !== "ACTIVE_LATEST") { const reason = `存在未完成或已阻止计划：${existingPlan.stage}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，跳过新决策`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, existingPlan.stage === "BLOCKED" ? "BLOCK" : "PLAN", reason)); continue; }
-    if (existingPlan && existingPlan.shipStrategyHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { const reason = `等待策略 API 索引新 hash=${existingPlan.shipStrategyHash}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，当前仍返回=${strategy.strategyHash}`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, "PLAN", reason)); continue; }
+    if (existingPlan?.shipStrategyHash && existingPlan.shipStrategyHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { const reason = `等待策略 API 索引新 hash=${existingPlan.shipStrategyHash}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，当前仍返回=${strategy.strategyHash}`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, "PLAN", reason)); continue; }
     const recalculatedHash = AquaProtocolContract.calculateStrategyHash(new HexString(strategy.strategyBytes)).toString();
     if (recalculatedHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：strategyBytes hash 校验失败，实际=${recalculatedHash}`); continue; }
     const market = markets.get(marketKey(strategy.tokens)); if (!market) throw new Error(`缺少 strategyHash=${strategy.strategyHash} 的 Pair 市场数据`);
@@ -324,7 +400,7 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
       const decision = decideRebalance({ balances: { initial: [strategy.tokens[0].initialBalance.raw, strategy.tokens[1].initialBalance.raw], current: [strategy.tokens[0].currentBalance.raw, strategy.tokens[1].currentBalance.raw], usd: [strategy.tokens[0].currentBalance.usd, strategy.tokens[1].currentBalance.usd] }, currentPrice: current, oldRange, marketHealthy, stableBreach: breachCount >= parameters.config.polling.stableSnapshotsRequired, cooldownElapsed, recenterExcessPercent: excess, minValueRatioBps: parameters.config.rebalance.convertToTwoSidedMinValueRatioBps });
       parameters.terminal?.upsert(dashboardRow(strategy, oldRange, outside, breachCount, parameters.config.polling.stableSnapshotsRequired, priceDeviation, decision));
       parameters.logger.info(`监控 strategyHash=${strategy.strategyHash}，Pair volumeUsd=${market.volumeUsd}，swaps=${market.swaps}，Pair/EMSH 偏离=${formatFixed(priceDeviation)}%，越界=${formatFixed(outside)}%，连续=${breachCount}/${parameters.config.polling.stableSnapshotsRequired}，决定=${decision.action}，原因=${decision.reason}`); logRange(parameters.logger, strategy, oldRange, "旧策略区间");
-      if (decision.action === "rehang") { const plan = createPlan(strategy, decision.targetMode, current, parameters.config, parameters.account.address, oldRange, decision.reason); parameters.state.plans[key] = plan; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state); parameters.logger.info(`已生成自动计划：旧=${plan.sourceStrategyHash}，新=${plan.shipStrategyHash}，模式=${plan.targetMode}，原因=${plan.decisionReason}`); await parameters.execute(plan); }
+      if (decision.action === "rehang") { const plan = createPlan(strategy, decision.targetMode, current, parameters.config, oldRange, decision.reason); parameters.state.plans[key] = plan; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state); parameters.logger.info(`已生成自动计划：旧=${plan.sourceStrategyHash}，模式=${plan.targetMode}，新策略金额与 hash 将在 dock 确认后按钱包实际余额冻结，原因=${plan.decisionReason}`); await parameters.execute(plan); }
       if (decision.action === "block") parameters.logger.info(`阻止 strategyHash=${strategy.strategyHash}：${decision.reason}`);
     } catch (error) { const message = error instanceof Error ? error.message.split("\n")[0] : "未知错误"; parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：${message}`); }
   }
@@ -386,7 +462,7 @@ async function main(): Promise<void> {
           return;
         }
         const latest = state.plans[plan.logicalPositionKey] ?? plan;
-        if (latest.stage === "DOCK_VERIFIED") {
+        if (latest.stage === "DOCK_VERIFIED" || latest.stage === "SHIP_PREPARED") {
           logger.info(`ship 尚未广播，保留原计划供下一轮恢复：逻辑仓位=${plan.logicalPositionKey}，原因=${message}`);
           return;
         }

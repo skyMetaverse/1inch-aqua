@@ -122,10 +122,11 @@ RPC 不参与“是否重挂、重挂成什么模式”的业务决策，不按�
 2. 读取目标策略每个 token 的 `rawBalances`，确认仍为 active，token count 完整，且余额与计划 API 快照的 `currentBalance.raw` 完全一致。
 3. 模拟 `dock`。
 4. 广播后校验 receipt、`Docked` 事件和 docked 状态。
-5. `ship` 前读取钱包 ERC20 余额、decimals、allowance；按已有通用兼容逻辑授权。
-6. 模拟并广播 `ship`；校验 receipt、`Shipped`、非零 `Pushed` 与新的 `rawBalances`。
+5. `dock` 已确认后读取钱包两个 ERC20 的实际余额；以 API 决定的模式导出最终投入额，并原子持久化 wallet snapshot、amounts、salt 和新 hash。
+6. `ship` 前再次读取钱包余额、decimals、allowance，只验证已冻结金额并按已有通用兼容逻辑授权，不得改变计划金额。
+7. 模拟并广播 `ship`；校验 receipt、`Shipped`、非零 `Pushed` 与新的 `rawBalances`。
 
-若 API 快照与预检链上余额不一致，计划立即失效；Bot 重新拉取 API，而不是使用链上余额改变模式或投入数量。
+若 API 快照与 dock 前预检链上余额不一致，计划立即失效；Bot 重新拉取 API，不使用链上余额改变模式。dock 确认后，钱包余额是新策略资金来源；一经冻结为 SHIP_PREPARED，后续余额变化不得改变该次投入数量。
 
 ## 3. 支持策略与逻辑仓位
 
@@ -265,9 +266,9 @@ current 两侧均为 0：阻止自动处理
 市场价格持续脱离旧区间，且满足 3 次确认、3 bp 额外偏离和 15 分钟冷却期时：
 
 ```text
-关闭旧策略
--> 以 API 当前非零侧 raw 余额
--> 使用 EMSH current
+关闭旧策略并确认 dock
+-> 读取目标侧实际钱包 raw 余额并全额冻结
+-> 使用 EMSH current 已计算的区间
 -> 以同方向创建新的 5 bp 单边策略
 ```
 
@@ -275,8 +276,8 @@ current 两侧均为 0：阻止自动处理
 
 ```text
 小侧 USD / 大侧 USD >= 80%：
-  关闭旧策略
-  -> 使用两侧 API currentBalance.raw
+  关闭旧策略并确认 dock
+  -> 使用两侧实际钱包余额并全额冻结
   -> 使用 EMSH current 创建上下各 5 bp 的双边策略
 
 小侧 USD / 大侧 USD < 80%：
@@ -294,8 +295,8 @@ current 两侧均为 0：阻止自动处理
 价格满足持续越界、额外偏离和冷却条件时：
 
 ```text
-关闭旧策略
--> 严格使用 API 两侧 currentBalance.raw
+关闭旧策略并确认 dock
+-> 严格使用两侧实际钱包余额并全额冻结
 -> 使用 EMSH current 创建上下各 5 bp 的双边策略
 ```
 
@@ -325,6 +326,7 @@ DISCOVERED
        -> DOCK_PRECHECKED
        -> DOCK_SENT
        -> DOCK_VERIFIED
+       -> SHIP_PREPARED
        -> SHIP_SENT
        -> SHIP_VERIFIED
        -> ACTIVE_LATEST
@@ -346,22 +348,23 @@ sourceCurrentBalanceRaw
 sourceCurrentBalanceUsd
 decisionReason
 targetMode
-targetAmountsRaw
 targetSqrtPriceMin
 targetSqrtPriceMax
-emshCurrentPriceText
-pairMarketSnapshot
 createdAt
 lastUpdatedAt
 stage
 dockTransactionHash?
+walletBalancesRaw?       # 仅 SHIP_PREPARED 后存在
+targetAmountsRaw?       # 由 walletBalancesRaw 与 targetMode 严格推导
+walletSnapshotAt?
+salt?
 shipStrategyHash?
 shipTransactionHash?
 ```
 
 写入必须使用“写临时文件 -> fsync -> 原子 rename”流程，避免进程崩溃留下半个 JSON。状态文件权限必须限制为当前用户；不包含私钥、密码、Bearer token 或完整 RPC URL。Bot 运行时以排他方式创建 `${stateFile}.lock`；`SIGINT`（Ctrl+C）和 `SIGTERM` 的处理器会同步释放该锁、清除内存私钥并恢复终端。SIGKILL、断电或进程崩溃无法运行用户态清理逻辑，只有确认没有运行中的 Bot 后才能人工删除遗留锁。
 
-状态格式为 v2，计划持久化的是 decimals-aware `targetSqrtPriceMin/Max`，而不是截断的 raw price。v1 状态文件可能包含 mixed-decimals 的错误报价，Bot 必须拒绝自动恢复；调用方应先人工核对链上状态并归档旧文件，不能把 v1 raw 参数迁移后直接广播。
+状态格式为 v3：dock 前只持久化 decimals-aware `targetSqrtPriceMin/Max` 与旧策略 API 快照；dock 后的 `SHIP_PREPARED` 才持久化钱包实际余额、按模式导出的 `targetAmountsRaw`、salt 和 ship hash。v1 状态文件可能包含 mixed-decimals 的错误报价，Bot 必须拒绝自动恢复；v2 的 PLAN_PERSISTED、DOCK_SENT、DOCK_VERIFIED 会删除其旧 API ship 金额并升级为 v3，v2 已 SHIP_SENT 或 ACTIVE_LATEST 则保留既有 hash 完成旧计划，不能重建为新钱包余额策略。
 
 ### 7.2 已 dock、未 ship 的恢复
 
@@ -370,15 +373,16 @@ shipTransactionHash?
 恢复规则：
 
 ```text
-若 stateFile 存在 PLAN_PERSISTED / DOCK_SENT / DOCK_VERIFIED / SHIP_SENT 未完成计划：
+若 stateFile 存在 PLAN_PERSISTED / DOCK_SENT / DOCK_VERIFIED / SHIP_PREPARED / SHIP_SENT 未完成计划：
   下一轮优先恢复该计划。
   不为同一 logicalPositionKey 生成新计划。
-  若 ship 尚未发送，重新进行必要余额、授权和 ship 模拟后继续。
-  若 ship 已发送，先查询该 hash receipt，确认成功后完成复核；失败才进入阻止状态。
+  DOCK_VERIFIED 尚未冻结新策略：重新读取实际钱包余额，并创建一次 SHIP_PREPARED 快照。
+  SHIP_PREPARED 已冻结钱包余额、salt 与 hash：只验证必要余额、授权和 ship 模拟后继续，不能重新读取余额改变金额。
+  若 ship 已发送，先查询持久化 hash 的 receipt，确认成功后完成复核；失败才进入阻止状态。
   若进程在 RPC 接收交易后、交易 hash 尚未来得及写入 stateFile 时中断，计划阶段会缺少 hash。此时 Bot 必须阻止该逻辑仓位，不能猜测重发；调用方需先在链上确认原交易是否已落链，再处理该状态文件。
 ```
 
-若恢复时钱包余额已不足以支付计划的 API 原始数量，停止自动交易并保留状态文件与中文日志。不得悄悄降低投入数量或改变单/双边模式。
+若 SHIP_PREPARED 后钱包余额已不足以支付冻结金额，停止自动交易并保留状态文件与中文日志。不得悄悄降低投入数量、改变单/双边模式或生成第二个 hash。
 
 ### 7.3 API 更新延迟
 
