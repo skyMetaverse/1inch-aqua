@@ -11,7 +11,7 @@ Aqua 不会因价格源变化自动成交。成交必须由 resolver/taker 发�
 ### 1.1 第一版包含
 
 1. 常驻 `bun run rebalance-bot` 入口；运行后交互解密本地私钥并直接执行自动监控和重挂，不提供 `--dry-run`。
-2. 发现官方 API 返回的当前 maker 全部 active 仓位。
+2. 发现官方 API `status=open` 返回的当前 maker 全部仓位，并监控 concentrated 的 `active` 与 `illiquidity` 状态。
 3. 通过官方策略 API 读取策略余额、USD 估值、策略成交量和手续费。
 4. 通过官方 Pair API 读取交易对市场活跃度。
 5. 通过官方 EMSH `current` API 获取用于精确计算区间的 current 价格。
@@ -133,7 +133,7 @@ RPC 不参与“是否重挂、重挂成什么模式”的业务决策，不按�
 
 ```text
 classification.type = concentrated
-classification.state = active
+classification.state = active 或 illiquidity
 chainId 与本地 RPC 一致
 maker 与解密私钥派生地址一致
 app 等于当前 SDK 支持的 Aqua SwapVM app
@@ -158,7 +158,7 @@ API 分页无法确认完整
 {chainId}:{maker}:{app}:{sortedTokenAddress0}:{sortedTokenAddress1}:{strategyHash}
 ```
 
-每个 active `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
+每个 open 且受支持的 `strategyHash` 都代表一个独立 Aqua 仓位，逻辑 key 使用 `{chainId}:{maker}:{app}:{sortedToken0}:{sortedToken1}:{strategyHash}`，因此相同 pair 的多个策略会分别监控、分别维护越界计数和分别执行重挂。`illiquidity` 表示 concentrated open 仓位当前缺乏可用流动性，正是再平衡需要观察的状态，不能按“不支持”跳过；重挂生成新 hash 后，旧计划保留为 API 索引延迟期间的保护记录，新 hash 使用独立观察状态。
 
 ## 4. 默认策略参数
 
@@ -433,7 +433,7 @@ YYYY-MM-DD HH:mm:ss.SSS [info]: 中文消息
 
 不记录私钥、密码、Bearer token、完整 RPC URL、完整 calldata 或未经脱敏的异常堆栈。
 
-交互 TTY 的终端展示与审计日志分离：终端使用 ANSI 原位刷新对齐策略表，显示策略短 hash、交易对、current、旧区间、越界、连续确认、Pair/EMSH 价差、状态/原因及最近 8 条关键事件；宽终端显示完整列，窄终端切换为对齐紧凑列。计划、dock、ship、恢复、阻止、错误和跳过事件进入近期事件区，普通轮询不刷屏。`stdout` 非 TTY、CI 或重定向时不输出 ANSI，自动保留原有逐行日志。无论终端模式如何，`logs/` 中均保留上述完整 `[info]` 审计行并作为复核依据。
+交互 TTY 的终端展示与审计日志分离：终端使用 ANSI 原位刷新对齐策略表，显示策略短 hash、交易对、完整 current、完整旧区间、完整越界、连续确认、完整 Pair/EMSH 价差、状态/原因及最近 8 条关键事件。数值列按本轮实际内容动态计算宽度，禁止以省略号截断；终端宽度不足时切换为逐策略多行详情，而不是降低数值精度。计划、dock、ship、恢复、阻止、错误和跳过事件进入近期事件区，连续重复事件只更新时间，普通轮询不刷屏。顶部同时显示 API open 数和实际展示行数，真正不支持的策略也以 BLOCK 行列出并显示 maker、chain、app、type 或 state 的明确原因。`stdout` 非 TTY、CI 或重定向时不输出 ANSI，自动保留原有逐行日志。无论终端模式如何，`logs/` 中均保留上述完整 `[info]` 审计行并作为复核依据。
 
 ## 10. 模块和文件规划
 
@@ -518,6 +518,6 @@ git diff --check
 2. Pair API 是否接受批量 pair，返回顺序是否与请求一一对应，及地址顺序是否强制规范排序。
 3. `lastPrice` 的时间语义，以及 Pair/EMSH 合理偏离阈值在高波动时是否需要调整。
 4. strategies API 新 ship 后的索引延迟分布。
-5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 active concentrated 策略必须分别监控，不得按 pair 合并或跳过。
+5. 已确认使用每个策略的 `strategyHash` 作为独立标识；同一 pair 的多个 open concentrated `active/illiquidity` 策略必须分别监控，不得按 pair 合并或跳过。
 
 真实返回与本文档冲突时，以真实行为为准，修正实现、测试、示例和本文档后再继续自动交易。

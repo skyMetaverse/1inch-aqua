@@ -116,7 +116,7 @@ bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 confi
 
 ## 自动再平衡 Bot
 
-Bot 监控 1inch 官方策略 API 返回的当前 maker 全部受支持 active concentrated 仓位，以策略 API 的 `currentBalance` 判断当前资产状态，以 EMSH current 计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据；自动重挂仍要求 Pair 最少 swaps 和 Pair/EMSH 价格交叉校验。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足连续越界、冷却期和上述价格安全条件时自动执行 `dock -> ship`。
+Bot 监控 1inch 官方策略 API `status=open` 返回的当前 maker 全部受支持 concentrated 仓位；`classification.state=active` 与 `illiquidity` 都会进入监控，以策略 API 的 `currentBalance` 判断当前资产状态，以 EMSH current 计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据；自动重挂仍要求 Pair 最少 swaps 和 Pair/EMSH 价格交叉校验。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足连续越界、冷却期和上述价格安全条件时自动执行 `dock -> ship`。
 
 先创建本地运行配置：
 
@@ -130,7 +130,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 active strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含 current、旧区间、越界、连续次数、Pair/EMSH 价差和决策状态；窄终端自动使用对齐紧凑列。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，不能在未人工审计的情况下恢复自动交易。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+Bot 只自动处理当前 SDK 支持的两 token concentrated 策略；open 仓位的 `classification.state=active` 与 `illiquidity` 都会进入监控。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含完整 current、完整旧区间、完整越界、连续次数、完整 Pair/EMSH 价差和决策状态；宽度不足时自动改用逐策略多行详情，关键数值绝不以省略号截断。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，不能在未人工审计的情况下恢复自动交易。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
 
 运行回归测试：
 

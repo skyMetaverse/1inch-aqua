@@ -42,6 +42,19 @@ function readRpcUrl(): string {
 }
 function maskRpcUrl(value: string): string { try { const url = new URL(value); return `${url.protocol}//${url.host}`; } catch { return "无效 RPC URL"; } }
 function requireAddress(value: string, field: string): Address { if (!isAddress(value)) throw new Error(`${field} 不是有效 EVM 地址`); return value; }
+
+/**
+ * 解释策略为何不能进入监控。官方请求使用 status=open，因此 concentrated 的 active 与 illiquidity 都是仍存在的可监控仓位；只有真实不匹配项才跳过。
+ */
+export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | "chainId" | "app" | "classification">, expectedMaker: Address, expectedChainId: number, expectedApp: Address): string | null {
+  const reasons: string[] = [];
+  if (strategy.maker.toLowerCase() !== expectedMaker.toLowerCase()) reasons.push(`maker 不匹配：${strategy.maker}`);
+  if (strategy.chainId !== expectedChainId) reasons.push(`chainId 不匹配：${strategy.chainId}`);
+  if (strategy.app.toLowerCase() !== expectedApp.toLowerCase()) reasons.push(`app 不匹配：${strategy.app}`);
+  if (strategy.classification.type !== "concentrated") reasons.push(`策略类型=${strategy.classification.type}，仅支持 concentrated`);
+  if (strategy.classification.state !== "active" && strategy.classification.state !== "illiquidity") reasons.push(`策略状态=${strategy.classification.state}，仅支持 active/illiquidity`);
+  return reasons.length > 0 ? reasons.join("；") : null;
+}
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 function positionIdentity(strategy: Pick<LogicalPositionInput, "chainId" | "maker" | "app" | "tokens">): string { return `${strategy.chainId}:${strategy.maker.toLowerCase()}:${strategy.app.toLowerCase()}:${[strategy.tokens[0].address, strategy.tokens[1].address].map((value) => value.toLowerCase()).sort().join(":")}`; }
 function marketKey(tokens: [{ address: Address }, { address: Address }]): string { return `${tokens[0].address.toLowerCase()}:${tokens[1].address.toLowerCase()}`; }
@@ -254,8 +267,10 @@ function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint,
 async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: RebalanceConfig; state: StateDocument; account: PrivateKeyAccount; app: Address; logger: Logger; terminal?: RebalanceTerminalDashboard; execute: (plan: PersistedPlan) => Promise<void> }): Promise<void> {
   parameters.terminal?.beginSnapshot(parameters.strategies.length);
   const supported = parameters.strategies.filter((strategy) => {
-    if (strategy.maker.toLowerCase() !== parameters.account.address.toLowerCase() || strategy.chainId !== parameters.config.chainId || strategy.app.toLowerCase() !== parameters.app.toLowerCase() || strategy.classification.type !== "concentrated" || strategy.classification.state !== "active") {
-      parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：maker、chain、app 或策略类型不受支持`);
+    const reason = unsupportedStrategyReason(strategy, parameters.account.address, parameters.config.chainId, parameters.app);
+    if (reason) {
+      parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：${reason}`);
+      parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, "BLOCK", reason));
       return false;
     }
     return true;
@@ -347,7 +362,7 @@ async function main(): Promise<void> {
           }
         }
         const strategies = await getActiveStrategies(account.address, chainId);
-        logger.info(`官方策略 API 返回 active 仓位数=${strategies.length}`);
+        logger.info(`官方策略 API 返回 open 仓位数=${strategies.length}`);
         await processSnapshot({ strategies, config, state, account, app, logger, terminal, execute });
         terminal.render();
       } catch (error) {

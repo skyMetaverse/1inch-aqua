@@ -65,22 +65,26 @@ test("宽终端面板的中文表头和策略行严格对齐", () => {
   const secondRow = lines[headerIndex + 3] ?? "";
   expect(displayWidth(firstRow)).toBe(displayWidth(header));
   expect(displayWidth(secondRow)).toBe(displayWidth(header));
-  expect(firstRow).toContain("当前价格仍在旧策略区间内");
-  expect(secondRow).toContain("连续确认");
+  expect(firstRow).toContain("0.08293339141264562");
+  expect(firstRow).toContain("0.08290044792982399 至 0.082950218060724931");
+  expect(secondRow).toContain("1.28%");
+  expect(secondRow).toContain("0.0710%");
+  expect(firstRow).not.toContain("0.0829333914...");
+  expect(firstRow).not.toContain("0.1088...");
 });
 
-/** 窄终端自动改用紧凑列，但仍保持表头与每行对齐，不输出半截 ANSI 表格。 */
-test("窄终端面板使用对齐的紧凑列", () => {
+/** 窄终端自动改用逐策略详情块，所有关键价格保持完整，不以省略号换取单行表格。 */
+test("窄终端面板完整显示逐策略价格详情", () => {
   const terminal = new MemoryTerminal(true, 100);
   const dashboard = new RebalanceTerminalDashboard(terminal, false);
   addRows(dashboard);
   dashboard.render();
-  const lines = visible(terminal.chunks.join("")).split("\n");
-  const headerIndex = lines.findIndex((line) => line.includes("当前/区间"));
-  expect(headerIndex).toBeGreaterThanOrEqual(0);
-  const header = lines[headerIndex] ?? "";
-  expect(displayWidth(lines[headerIndex + 2] ?? "")).toBe(displayWidth(header));
-  expect(displayWidth(lines[headerIndex + 3] ?? "")).toBe(displayWidth(header));
+  const output = visible(terminal.chunks.join(""));
+  expect(output).toContain("当前价格  : 0.08293339141264562");
+  expect(output).toContain("价格区间  : 0.08290044792982399 至 0.082950218060724931");
+  expect(output).toContain("越界      : 1.28%");
+  expect(output).toContain("价差      : 0.0710%");
+  expect(output).not.toContain(".082933~");
 });
 
 /** 普通监控行不应刷事件区，交易阶段必须进入近期事件，保证值守时先看到真实资金动作。 */

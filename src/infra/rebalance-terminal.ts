@@ -88,12 +88,6 @@ function shortHash(value: string): string {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
-/** 窄终端将长价格文本压缩为可比较前缀；精确值仍在文件日志中保留。 */
-function compactPrice(value: string): string {
-  const normalized = value.replace(/^0\./, ".");
-  return normalized.length <= 9 ? normalized : `${normalized.slice(0, 8)}~`;
-}
-
 function color(value: string, code: string, enabled: boolean): string {
   return enabled ? `${code}${value}${ANSI.reset}` : value;
 }
@@ -114,7 +108,7 @@ function eventColor(kind: DashboardEventKind): string {
 
 /** 将 Bot 审计消息归类为有限的近期事件；普通每轮监控和区间行不重复占用事件区。 */
 function auditEventKind(message: string): DashboardEventKind | null {
-  if (/^(监控 strategyHash=|旧策略区间：|官方策略 API 返回 active 仓位数=|开始请求 EMSH current：|EMSH current 成功：)/.test(message)) return null;
+  if (/^(监控 strategyHash=|旧策略区间：|官方策略 API 返回 (?:active|open) 仓位数=|开始请求 EMSH current：|EMSH current 成功：)/.test(message)) return null;
   if (/(失败|错误|阻止|不一致|退出)/.test(message)) return "ERROR";
   if (/(已生成自动计划|dock|ship|恢复未完成计划|恢复 dock|恢复 ship|自动重挂完成)/.test(message)) return "ACTION";
   if (/(跳过|冷却|等待策略 API)/.test(message)) return "WARN";
@@ -127,7 +121,7 @@ function auditEventKind(message: string): DashboardEventKind | null {
  */
 export class RebalanceTerminalDashboard {
   readonly enabled: boolean;
-  private activeStrategies = 0;
+  private openStrategies = 0;
   private rows = new Map<string, RebalanceDashboardRow>();
   private events: DashboardEvent[] = [];
   private updatedAt = shortTime();
@@ -137,8 +131,8 @@ export class RebalanceTerminalDashboard {
   }
 
   /** 开始一轮新快照，先清理不再从 API 返回的旧策略行。 */
-  beginSnapshot(activeStrategies: number): void {
-    this.activeStrategies = activeStrategies;
+  beginSnapshot(openStrategies: number): void {
+    this.openStrategies = openStrategies;
     this.rows.clear();
     this.updatedAt = shortTime();
   }
@@ -150,6 +144,12 @@ export class RebalanceTerminalDashboard {
 
   /** 将重要运行事件加入固定容量队列，超出时只丢弃最旧的已展示事件。 */
   addEvent(kind: DashboardEventKind, message: string): void {
+    const latest = this.events.at(-1);
+    // 连续轮询可能重复同一条跳过/等待原因；更新时间而不是占满整个近期事件区。
+    if (latest?.kind === kind && latest.message === message) {
+      latest.time = shortTime();
+      return;
+    }
     this.events.push({ time: shortTime(), kind, message });
     if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
   }
@@ -166,52 +166,63 @@ export class RebalanceTerminalDashboard {
   private statusSummary(): string {
     const counts: Record<DashboardStatus, number> = { KEEP: 0, WARN: 0, ACTION: 0, BLOCK: 0, PLAN: 0 };
     for (const row of this.rows.values()) counts[row.status] += 1;
-    return `active=${this.activeStrategies} keep=${counts.KEEP} warn=${counts.WARN} action=${counts.ACTION + counts.PLAN} block=${counts.BLOCK}`;
+    return `open=${this.openStrategies} shown=${this.rows.size} keep=${counts.KEEP} warn=${counts.WARN} action=${counts.ACTION + counts.PLAN} block=${counts.BLOCK}`;
   }
 
-  private fullTable(width: number): string[] {
+  /** 宽度足够时动态计算列宽；数值列不设截断上限，保证 current/区间/越界/价差完整显示。 */
+  private fullTable(width: number): string[] | null {
+    const rows = [...this.rows.values()];
+    const gaps = 14;
+    const columnValues = [
+      { header: "策略", values: rows.map((row) => shortHash(row.strategyHash)), minimum: 14 },
+      { header: "交易对", values: rows.map((row) => row.pair), minimum: 14 },
+      { header: "当前价格", values: rows.map((row) => row.current), minimum: 15 },
+      { header: "价格区间", values: rows.map((row) => `${row.min} 至 ${row.max}`), minimum: 29 },
+      { header: "越界", values: rows.map((row) => row.outside), minimum: 10 },
+      { header: "连续", values: rows.map((row) => row.breach), minimum: 7 },
+      { header: "价差", values: rows.map((row) => row.deviation), minimum: 10 },
+    ];
+    const widths = columnValues.map((column) => Math.max(column.minimum, displayWidth(column.header), ...column.values.map(displayWidth)));
+    const fixedWidth = widths.reduce((total, value) => total + value, 0) + gaps;
+    const reasonWidth = Math.max(18, width - fixedWidth);
+    if (fixedWidth + reasonWidth > width) return null;
     const columns = [
-      { header: "策略", width: 14, value: (row: RebalanceDashboardRow) => shortHash(row.strategyHash) },
-      { header: "交易对", width: 18, value: (row: RebalanceDashboardRow) => row.pair },
-      { header: "当前价格", width: 15, value: (row: RebalanceDashboardRow) => row.current },
-      { header: "价格区间", width: 29, value: (row: RebalanceDashboardRow) => `${row.min}-${row.max}` },
-      { header: "越界", width: 10, value: (row: RebalanceDashboardRow) => row.outside },
-      { header: "连续", width: 7, value: (row: RebalanceDashboardRow) => row.breach },
-      { header: "价差", width: 10, value: (row: RebalanceDashboardRow) => row.deviation },
-      { header: "状态/原因", width: Math.max(18, width - 125), value: (row: RebalanceDashboardRow) => `[${row.status}] ${row.reason}` },
+      { header: columnValues[0]?.header ?? "策略", width: widths[0] ?? 14, value: (row: RebalanceDashboardRow) => shortHash(row.strategyHash) },
+      { header: columnValues[1]?.header ?? "交易对", width: widths[1] ?? 14, value: (row: RebalanceDashboardRow) => row.pair },
+      { header: columnValues[2]?.header ?? "当前价格", width: widths[2] ?? 15, value: (row: RebalanceDashboardRow) => row.current },
+      { header: columnValues[3]?.header ?? "价格区间", width: widths[3] ?? 29, value: (row: RebalanceDashboardRow) => `${row.min} 至 ${row.max}` },
+      { header: columnValues[4]?.header ?? "越界", width: widths[4] ?? 10, value: (row: RebalanceDashboardRow) => row.outside },
+      { header: columnValues[5]?.header ?? "连续", width: widths[5] ?? 7, value: (row: RebalanceDashboardRow) => row.breach },
+      { header: columnValues[6]?.header ?? "价差", width: widths[6] ?? 10, value: (row: RebalanceDashboardRow) => row.deviation },
+      { header: "状态/原因", width: reasonWidth, value: (row: RebalanceDashboardRow) => `[${row.status}] ${row.reason}` },
     ];
     const header = columns.map((column) => cell(column.header, column.width)).join("  ");
     const divider = "-".repeat(displayWidth(header));
-    const rows = [...this.rows.values()].map((row) => columns.map((column, index) => {
+    const renderedRows = rows.map((row) => columns.map((column, index) => {
       const value = cell(column.value(row), column.width);
       return index === columns.length - 1 ? color(value, statusColor(row.status), this.useColor) : value;
     }).join("  "));
-    return [header, divider, ...rows];
+    return [header, divider, ...renderedRows];
   }
 
-  private compactTable(): string[] {
-    const columns = [
-      { header: "策略", width: 14, value: (row: RebalanceDashboardRow) => shortHash(row.strategyHash) },
-      { header: "交易对", width: 14, value: (row: RebalanceDashboardRow) => row.pair },
-      { header: "当前/区间", width: 24, value: (row: RebalanceDashboardRow) => `${compactPrice(row.current)} ${compactPrice(row.min)}-${compactPrice(row.max)}` },
-      { header: "越界", width: 9, value: (row: RebalanceDashboardRow) => row.outside },
-      { header: "连续", width: 7, value: (row: RebalanceDashboardRow) => row.breach },
-      { header: "状态", width: 12, value: (row: RebalanceDashboardRow) => `[${row.status}]` },
-    ];
-    const header = columns.map((column) => cell(column.header, column.width)).join("  ");
-    const divider = "-".repeat(displayWidth(header));
-    const rows = [...this.rows.values()].map((row) => columns.map((column, index) => {
-      const value = cell(column.value(row), column.width);
-      return index === columns.length - 1 ? color(value, statusColor(row.status), this.useColor) : value;
-    }).join("  "));
-    return [header, divider, ...rows];
+  /** 数值列无法在当前终端完整容纳时改用逐策略详情块，绝不用省略号隐藏用户要求的关键价格数据。 */
+  private detailTable(): string[] {
+    const lines: string[] = [];
+    for (const row of this.rows.values()) {
+      lines.push(color(`${shortHash(row.strategyHash)}  ${row.pair}  [${row.status}]`, statusColor(row.status), this.useColor));
+      lines.push(`  ${cell("当前价格", 10)}: ${row.current}`);
+      lines.push(`  ${cell("价格区间", 10)}: ${row.min} 至 ${row.max}`);
+      lines.push(`  ${cell("越界", 10)}: ${row.outside}    ${cell("连续", 10)}: ${row.breach}    ${cell("价差", 10)}: ${row.deviation}`);
+      lines.push(`  ${cell("原因", 10)}: ${row.reason}`);
+    }
+    return lines;
   }
 
   /** 使用 ANSI 清屏原位刷新；只有 TTY 进入此分支，因此管道、CI 和文件重定向不会收到控制字符。 */
   render(): void {
     if (!this.enabled) return;
     const columns = this.output.columns ?? 120;
-    const table = columns >= 145 ? this.fullTable(columns) : this.compactTable();
+    const table = this.fullTable(columns) ?? this.detailTable();
     const eventWidth = Math.max(40, columns - 2);
     const eventLines = this.events.length === 0
       ? [color("暂无关键事件", ANSI.dim, this.useColor)]
@@ -229,7 +240,7 @@ export class RebalanceTerminalDashboard {
     this.output.write(`\x1b[2J\x1b[H${panel}${ANSI.reset}`);
   }
 
-    /** 正常退出时恢复 ANSI 样式并换行，避免 shell prompt 紧贴最后一帧面板。 */
+  /** 正常退出时恢复 ANSI 样式并换行，避免 shell prompt 紧贴最后一帧面板。 */
   close(): void {
     if (this.enabled) this.output.write("\x1b[0m\n");
   }
