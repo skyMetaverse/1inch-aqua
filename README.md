@@ -130,7 +130,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 active strategyHash 会分别监控、分别决策、分别保存状态。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，不能在未人工审计的情况下恢复自动交易。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+Bot 只自动处理当前 SDK 支持的两 token concentrated 策略。API 分页未确认、价格源偏离过大、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 active strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含 current、旧区间、越界、连续次数、Pair/EMSH 价差和决策状态；窄终端自动使用对齐紧凑列。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，不能在未人工审计的情况下恢复自动交易。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
 
 运行回归测试：
 

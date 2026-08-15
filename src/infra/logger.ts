@@ -1,7 +1,7 @@
 /**
  * 添加 LP 的统一中文运行日志模块。
- * 核心功能：按跨平台安全文件名创建每次运行日志，并将固定 info 格式同时写入终端和文件。
- * 主要流程：创建 logs 文件 -> 格式化毫秒时间戳 -> 逐行安全落盘和输出。
+ * 核心功能：按跨平台安全文件名创建每次运行日志，并将固定 info 格式写入文件；调用方可选择是否同步输出终端。
+ * 主要流程：创建 logs 文件 -> 格式化毫秒时间戳 -> 逐行安全落盘 -> 按运行模式输出终端。
  */
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,8 +18,8 @@ function timestamp(forFileName: boolean): string {
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}${separator}${pad(now.getMinutes())}${separator}${pad(now.getSeconds())}.${pad(now.getMilliseconds(), 3)}`;
 }
 
-/** 创建一次运行唯一的日志文件；文件名不用冒号以兼容 Windows。 */
-export function createLogger(directory = "logs"): Logger {
+/** 创建一次运行唯一的日志文件；文件名不用冒号以兼容 Windows。终端面板模式会关闭逐行 stdout，但文件审计永远保留。 */
+export function createLogger(directory = "logs", options: { writeToStdout?: boolean } = {}): Logger {
   if (!existsSync(directory)) mkdirSync(directory, { recursive: true });
   const filePath = join(directory, `${timestamp(true)}.log`);
   writeFileSync(filePath, "", { encoding: "utf8", flag: "wx" });
@@ -27,8 +27,8 @@ export function createLogger(directory = "logs"): Logger {
     filePath,
     info(message: string): void {
       const line = `${timestamp(false)} [info]: ${message}`;
-      process.stdout.write(`${line}\n`);
       appendFileSync(filePath, `${line}\n`, "utf8");
+      if (options.writeToStdout !== false) process.stdout.write(`${line}\n`);
     },
   };
 }

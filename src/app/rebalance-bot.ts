@@ -20,6 +20,7 @@ import { getActiveStrategies, getPairMarkets, type ApiStrategy, type PairMarket 
 import { readTokenState } from "../infra/erc20.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
+import { RebalanceTerminalDashboard, type DashboardStatus, type RebalanceDashboardRow } from "../infra/rebalance-terminal.ts";
 import { sendLocallySignedTransaction } from "../infra/rpc.ts";
 import { acquireRebalanceLock, loadRebalanceState, saveRebalanceState, type PersistedPlan, type StateDocument } from "../infra/rebalance-state.ts";
 import { ensureMaximumAllowance } from "./add-lp.ts";
@@ -28,6 +29,7 @@ const DEFAULT_CONFIG_PATH = "config/rebalance.jsonc";
 const ENV_FILE = ".env";
 const DOCKED_TOKENS_COUNT = 0xff;
 let activeLogger: Logger | null = null;
+let activeTerminal: RebalanceTerminalDashboard | null = null;
 
 /** 从 .env 读取 RPC，仅保留必要字段，不将包含私钥的整个文件载入环境变量。 */
 function readRpcUrl(): string {
@@ -84,6 +86,56 @@ function registerCompletedObservation(state: StateDocument, plan: PersistedPlan,
   saveRebalanceState(config.runtime.stateFile, state);
 }
 function logRange(logger: Logger, strategy: ApiStrategy, range: { min: bigint; current: bigint; max: bigint }, prefix: string): void { logger.info(`${prefix}：1 ${strategy.tokens[0].symbol} = ${formatFixed(range.min)} 至 ${formatFixed(range.max)} ${strategy.tokens[1].symbol}；current=1 ${strategy.tokens[0].symbol} = ${formatFixed(range.current)} ${strategy.tokens[1].symbol}`); }
+
+/** 终端状态只反映决策结果：在区间内为 KEEP，越界等待/冷却为 WARN，计划和链上动作由 ACTION/PLAN 显示。 */
+function dashboardStatus(decision: ReturnType<typeof decideRebalance>): DashboardStatus {
+  if (decision.action === "rehang") return "ACTION";
+  if (decision.action === "block") return "BLOCK";
+  return decision.reason === "当前价格仍在旧策略区间内" ? "KEEP" : "WARN";
+}
+
+/** 将精确 bigint 快照转换为仅用于终端呈现的行；文件日志仍保留完整原始字段和原因。 */
+function dashboardRow(strategy: ApiStrategy, range: { min: bigint; current: bigint; max: bigint }, outside: bigint, breachCount: number, requiredBreaches: number, priceDeviation: bigint, decision: ReturnType<typeof decideRebalance>): RebalanceDashboardRow {
+  return {
+    strategyHash: strategy.strategyHash,
+    pair: `${strategy.tokens[0].symbol}/${strategy.tokens[1].symbol}`,
+    current: formatFixed(range.current),
+    min: formatFixed(range.min),
+    max: formatFixed(range.max),
+    outside: `${formatFixed(outside)}%`,
+    breach: `${breachCount}/${requiredBreaches}`,
+    deviation: `${formatFixed(priceDeviation)}%`,
+    status: dashboardStatus(decision),
+    reason: decision.reason,
+  };
+}
+
+/** 面板模式仅过滤终端输出，审计 logger 仍无条件把每条中文 [info] 写入本次 logs 文件。 */
+function createDashboardLogger(auditLogger: Logger, dashboard: RebalanceTerminalDashboard): Logger {
+  return {
+    filePath: auditLogger.filePath,
+    info(message: string): void {
+      auditLogger.info(message);
+      if (dashboard.recordAuditMessage(message)) dashboard.render();
+    },
+  };
+}
+
+/** API 索引延迟或未完成计划没有可用 current 快照时，仍保留一行明确说明该策略为何暂不决策。 */
+function dashboardPlaceholderRow(strategy: ApiStrategy, status: DashboardStatus, reason: string): RebalanceDashboardRow {
+  return {
+    strategyHash: strategy.strategyHash,
+    pair: `${strategy.tokens[0].symbol}/${strategy.tokens[1].symbol}`,
+    current: "--",
+    min: "--",
+    max: "--",
+    outside: "--",
+    breach: "--",
+    deviation: "--",
+    status,
+    reason,
+  };
+}
 
 /** dock 前核对 API 快照，避免索引延迟让 Bot 关闭的不是计划中的余额。 */
 async function verifyApiSnapshotOnChain(client: ReturnType<typeof createPublicClient>, registry: Address, account: Address, plan: PersistedPlan): Promise<void> {
@@ -199,7 +251,8 @@ function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint,
 }
 
 /** 每轮处理 API 返回的完整仓位集合；每个 strategyHash 都是独立仓位，同 pair 不再互相跳过。 */
-async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: RebalanceConfig; state: StateDocument; account: PrivateKeyAccount; app: Address; logger: Logger; execute: (plan: PersistedPlan) => Promise<void> }): Promise<void> {
+async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: RebalanceConfig; state: StateDocument; account: PrivateKeyAccount; app: Address; logger: Logger; terminal?: RebalanceTerminalDashboard; execute: (plan: PersistedPlan) => Promise<void> }): Promise<void> {
+  parameters.terminal?.beginSnapshot(parameters.strategies.length);
   const supported = parameters.strategies.filter((strategy) => {
     if (strategy.maker.toLowerCase() !== parameters.account.address.toLowerCase() || strategy.chainId !== parameters.config.chainId || strategy.app.toLowerCase() !== parameters.app.toLowerCase() || strategy.classification.type !== "concentrated" || strategy.classification.state !== "active") {
       parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：maker、chain、app 或策略类型不受支持`);
@@ -212,8 +265,8 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
   const markets = new Map(uniquePairs.map((pair, index) => [`${pair[0].toLowerCase()}:${pair[1].toLowerCase()}`, marketResults[index]]));
   for (const strategy of supported) {
     const key = logicalKey(strategy); const existingPlan = parameters.state.plans[key];
-    if (existingPlan && existingPlan.stage !== "ACTIVE_LATEST") { parameters.logger.info(`逻辑仓位=${key} 存在未完成或已阻止计划，跳过新决策：阶段=${existingPlan.stage}`); continue; }
-    if (existingPlan && existingPlan.shipStrategyHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { parameters.logger.info(`逻辑仓位=${key} 等待策略 API 索引新 hash=${existingPlan.shipStrategyHash}，当前仍返回=${strategy.strategyHash}`); continue; }
+    if (existingPlan && existingPlan.stage !== "ACTIVE_LATEST") { const reason = `存在未完成或已阻止计划：${existingPlan.stage}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，跳过新决策`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, existingPlan.stage === "BLOCKED" ? "BLOCK" : "PLAN", reason)); continue; }
+    if (existingPlan && existingPlan.shipStrategyHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { const reason = `等待策略 API 索引新 hash=${existingPlan.shipStrategyHash}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，当前仍返回=${strategy.strategyHash}`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, "PLAN", reason)); continue; }
     const recalculatedHash = AquaProtocolContract.calculateStrategyHash(new HexString(strategy.strategyBytes)).toString();
     if (recalculatedHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：strategyBytes hash 校验失败，实际=${recalculatedHash}`); continue; }
     const market = markets.get(marketKey(strategy.tokens)); if (!market) throw new Error(`缺少 strategyHash=${strategy.strategyHash} 的 Pair 市场数据`);
@@ -229,6 +282,7 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
       const outside = outsideDistancePercent(current, oldRange); const excess = parsePercentage(parameters.config.rebalance.recenterExcess, "recenterExcess"); const observation = parameters.state.observations[key]; const prior = observation?.strategyHash === strategy.strategyHash ? observation : { strategyHash: strategy.strategyHash, breachCount: 0, lastShipAt: observation?.lastShipAt }; const breachCount = outside > excess ? prior.breachCount + 1 : 0; parameters.state.observations[key] = { ...prior, breachCount }; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
       const cooldownElapsed = !prior.lastShipAt || Date.now() - prior.lastShipAt >= parameters.config.rebalance.cooldownSeconds * 1000;
       const decision = decideRebalance({ balances: { initial: [strategy.tokens[0].initialBalance.raw, strategy.tokens[1].initialBalance.raw], current: [strategy.tokens[0].currentBalance.raw, strategy.tokens[1].currentBalance.raw], usd: [strategy.tokens[0].currentBalance.usd, strategy.tokens[1].currentBalance.usd] }, currentPrice: current, oldRange, marketHealthy, stableBreach: breachCount >= parameters.config.polling.stableSnapshotsRequired, cooldownElapsed, recenterExcessPercent: excess, minValueRatioBps: parameters.config.rebalance.convertToTwoSidedMinValueRatioBps });
+      parameters.terminal?.upsert(dashboardRow(strategy, oldRange, outside, breachCount, parameters.config.polling.stableSnapshotsRequired, priceDeviation, decision));
       parameters.logger.info(`监控 strategyHash=${strategy.strategyHash}，Pair volumeUsd=${market.volumeUsd}，swaps=${market.swaps}，Pair/EMSH 偏离=${formatFixed(priceDeviation)}%，越界=${formatFixed(outside)}%，连续=${breachCount}/${parameters.config.polling.stableSnapshotsRequired}，决定=${decision.action}，原因=${decision.reason}`); logRange(parameters.logger, strategy, oldRange, "旧策略区间");
       if (decision.action === "rehang") { const plan = createPlan(strategy, decision.targetMode, current, parameters.config, parameters.account.address, oldRange, decision.reason); parameters.state.plans[key] = plan; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state); parameters.logger.info(`已生成自动计划：旧=${plan.sourceStrategyHash}，新=${plan.shipStrategyHash}，模式=${plan.targetMode}，原因=${plan.decisionReason}`); await parameters.execute(plan); }
       if (decision.action === "block") parameters.logger.info(`阻止 strategyHash=${strategy.strategyHash}：${decision.reason}`);
@@ -236,10 +290,26 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
   }
 }
 
+/**
+ * Bot 入口：TTY 使用动态面板且文件保留完整审计行；非 TTY 保持逐行输出，确保重定向和 CI 行为不变。
+ * 锁和私钥均在 finally 清理，并在退出时复位 ANSI 样式，避免密码输入或启动校验失败后遗留状态文件锁或终端样式。
+ */
 async function main(): Promise<void> {
-  const configPath = parseBotArguments(); const logger = createLogger(); activeLogger = logger; const config = validateRebalanceConfig(readJsoncFile(configPath)); logger.info(`启动自动再平衡 Bot：配置=${configPath}，chainId=${config.chainId}，日志=${logger.filePath}`);
-  const release = acquireRebalanceLock(config.runtime.stateFile); const rpcUrl = readRpcUrl(); logger.info(`已读取 RPC 配置：${maskRpcUrl(rpcUrl)}`); const privateKey = await getDecryptedPrivateKey();
+  const configPath = parseBotArguments();
+  const terminal = new RebalanceTerminalDashboard(process.stdout);
+  activeTerminal = terminal;
+  const auditLogger = createLogger("logs", { writeToStdout: !terminal.enabled });
+  const logger = terminal.enabled ? createDashboardLogger(auditLogger, terminal) : auditLogger;
+  activeLogger = logger;
+  const config = validateRebalanceConfig(readJsoncFile(configPath));
+  logger.info(`启动自动再平衡 Bot：配置=${configPath}，chainId=${config.chainId}，日志=${logger.filePath}`);
+  let release: (() => void) | undefined;
+  let privateKey: Buffer | undefined;
   try {
+    release = acquireRebalanceLock(config.runtime.stateFile);
+    const rpcUrl = readRpcUrl();
+    logger.info(`已读取 RPC 配置：${maskRpcUrl(rpcUrl)}`);
+    privateKey = await getDecryptedPrivateKey();
     const account = privateKeyToAccount(privateKey.toString("utf8") as Hex); const preliminary = createPublicClient({ transport: http(rpcUrl) }); const chainId = await preliminary.getChainId(); if (chainId !== config.chainId) throw new Error(`RPC chainId=${chainId} 与配置不一致`); const chain = defineChain({ id: chainId, name: `Aqua chain ${chainId}`, nativeCurrency: { name: "Native", symbol: "NATIVE", decimals: 18 }, rpcUrls: { default: { http: [rpcUrl] } } }); const client = createPublicClient({ chain, transport: http(rpcUrl) }); const registrySdk = AQUA_CONTRACT_ADDRESSES[chainId as NetworkEnum]; const appSdk = AQUA_SWAP_VM_CONTRACT_ADDRESSES[chainId as NetworkEnum]; if (!registrySdk || !appSdk) throw new Error(`SDK 不支持 chainId=${chainId}`); const registry = requireAddress(registrySdk.toString(), "Aqua registry"); const app = requireAddress(appSdk.toString(), "Aqua SwapVM app"); if (!await client.getCode({ address: registry })) throw new Error("Aqua registry 未检测到合约代码"); logger.info(`私钥解密与网络校验成功：maker=${account.address}，registry=${registry}，app=${app}`);
     const state = loadRebalanceState(config.runtime.stateFile);
     if (migrateStateKeys(state)) {
@@ -268,7 +338,24 @@ async function main(): Promise<void> {
         logger.info(`自动执行已阻止：逻辑仓位=${plan.logicalPositionKey}，原因=${message}`);
       }
     };
-    while (true) { try { for (const plan of Object.values(state.plans)) if (plan.stage !== "ACTIVE_LATEST" && plan.stage !== "BLOCKED") { logger.info(`恢复未完成计划：逻辑仓位=${plan.logicalPositionKey}，阶段=${plan.stage}`); await execute(plan); } const strategies = await getActiveStrategies(account.address, chainId); logger.info(`官方策略 API 返回 active 仓位数=${strategies.length}`); await processSnapshot({ strategies, config, state, account, app, logger, execute }); } catch (error) { logger.info(`本轮监控失败：${error instanceof Error ? error.message.split("\n")[0] : "未知错误"}`); } await sleep(config.polling.intervalSeconds * 1000); }
-  } finally { privateKey.fill(0); release(); }
+    while (true) {
+      try {
+        for (const plan of Object.values(state.plans)) {
+          if (plan.stage !== "ACTIVE_LATEST" && plan.stage !== "BLOCKED") {
+            logger.info(`恢复未完成计划：逻辑仓位=${plan.logicalPositionKey}，阶段=${plan.stage}`);
+            await execute(plan);
+          }
+        }
+        const strategies = await getActiveStrategies(account.address, chainId);
+        logger.info(`官方策略 API 返回 active 仓位数=${strategies.length}`);
+        await processSnapshot({ strategies, config, state, account, app, logger, terminal, execute });
+        terminal.render();
+      } catch (error) {
+        logger.info(`本轮监控失败：${error instanceof Error ? error.message.split("\n")[0] : "未知错误"}`);
+        terminal.render();
+      }
+      await sleep(config.polling.intervalSeconds * 1000);
+    }
+  } finally { privateKey?.fill(0); release?.(); terminal.close(); }
 }
-if (import.meta.main) main().catch((error: unknown) => { const message = error instanceof Error ? error.message.split("\n")[0] : "未知错误"; if (activeLogger) activeLogger.info(`自动再平衡 Bot 退出：${message}`); else process.stderr.write(`${formatLogLine(`自动再平衡 Bot 退出：${message}`)}\n`); process.exitCode = 1; });
+if (import.meta.main) main().catch((error: unknown) => { const message = error instanceof Error ? error.message.split("\n")[0] : "未知错误"; if (activeLogger) activeLogger.info(`自动再平衡 Bot 退出：${message}`); else process.stderr.write(`${formatLogLine(`自动再平衡 Bot 退出：${message}`)}\n`); activeTerminal?.close(); process.exitCode = 1; });

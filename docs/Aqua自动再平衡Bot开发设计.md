@@ -433,6 +433,8 @@ YYYY-MM-DD HH:mm:ss.SSS [info]: 中文消息
 
 不记录私钥、密码、Bearer token、完整 RPC URL、完整 calldata 或未经脱敏的异常堆栈。
 
+交互 TTY 的终端展示与审计日志分离：终端使用 ANSI 原位刷新对齐策略表，显示策略短 hash、交易对、current、旧区间、越界、连续确认、Pair/EMSH 价差、状态/原因及最近 8 条关键事件；宽终端显示完整列，窄终端切换为对齐紧凑列。计划、dock、ship、恢复、阻止、错误和跳过事件进入近期事件区，普通轮询不刷屏。`stdout` 非 TTY、CI 或重定向时不输出 ANSI，自动保留原有逐行日志。无论终端模式如何，`logs/` 中均保留上述完整 `[info]` 审计行并作为复核依据。
+
 ## 10. 模块和文件规划
 
 ```text
@@ -458,12 +460,14 @@ src/
     rebalance-state.ts              # 原子状态文件、锁和恢复记录
     emsh.ts                         # 复用 current
     erc20.ts / logger.ts / rpc.ts   # 复用
+    rebalance-terminal.ts            # TTY 对齐状态表与近期事件渲染
 
 test/
   aqua-api.test.ts
   rebalance-config.test.ts
   rebalance.test.ts
   rebalance-state.test.ts
+  rebalance-terminal.test.ts         # 对齐列宽、事件队列和非 TTY 降级
 ```
 
 可以从 `scripts/cancel-all-active-lp.ts` 提取 API 查询、dock 预检和事件验证；提取后须保留现有一键关闭行为与测试覆盖，不能让 Bot 和关闭脚本复制两套不一致的交易安全逻辑。
