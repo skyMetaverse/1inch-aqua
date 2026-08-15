@@ -1,7 +1,7 @@
 /**
  * Aqua 活跃 LP 一键取消脚本：通过 1inch Aqua 仓位查询接口发现当前 maker 的 open 仓位，并按数量选择 atomic multicall 或串行 dock。
  * 核心功能：复用加密私钥、校验 API 与链上策略状态、模拟 dock、广播交易并验证 Docked 事件和 docked 状态。
- * 主要流程：解密私钥 -> 查询 open 仓位 -> 链上预检与模拟 -> 超过两个时 atomic multicall dock，否则串行 dock -> 回执与状态复核。
+ * 主要流程：解密私钥 -> 查询 open 仓位 -> 链上预检与模拟 -> 至少两个时 atomic multicall dock，否则串行 dock -> 回执与状态复核。
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
@@ -27,7 +27,7 @@ import {
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "./encrypt-private-key.ts";
-import { buildAquaMulticallTransaction } from "../src/aqua/multicall.ts";
+import { buildAquaMulticallTransaction, shouldUseAquaMulticall } from "../src/aqua/multicall.ts";
 import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
 
 const ENV_FILE = ".env";
@@ -480,7 +480,7 @@ async function cancelStrategiesWithMulticall(parameters: {
 }
 
 /**
- * 脚本入口：查询当前 maker 全部 open 仓位；超过两个时原子 multicall dock，否则保持串行 dock。
+ * 脚本入口：查询当前 maker 全部 open 仓位；至少两个时原子 multicall dock，否则保持串行 dock。
  * 任一预检或完整 batch 模拟失败均不发送交易，避免原子批次出现不可预期的部分关闭。
  */
 async function main(): Promise<void> {
@@ -546,8 +546,8 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (strategies.length > 2) {
-      logger.info(`活跃仓位数=${strategies.length} > 2，启用单笔 atomic multicall dock；任一子调用失败会整批回滚`);
+    if (shouldUseAquaMulticall(strategies.length)) {
+      logger.info(`活跃仓位数=${strategies.length} >= 2，启用单笔 atomic multicall dock；任一子调用失败会整批回滚`);
       await cancelStrategiesWithMulticall({ strategies, publicClient, registry, account, chainId, chain, rpcUrl, dryRun, logger });
     } else {
       for (let index = 0; index < strategies.length; index += 1) {

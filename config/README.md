@@ -45,7 +45,7 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行仅在现有 allowance 未覆盖本次投入时尝试 `MAX_UINT256`。确认后脚本重新读取实际 allowance，只要该额度覆盖本次投入就继续；不会假设所有 ERC20 都原样存储 `MAX_UINT256`。所有非零且不足的 allowance 会先发送并确认 `approve(0)`，随后尝试最大授权，以兼容要求清零后才能修改额度的 ERC20。授权成功后 ship 失败时，授权仍会保留；脚本不会自动撤销授权。
 
-当 `positions` 数量超过 2 时，所有仓位完成单笔 ship 模拟并按 token 汇总余额后，会再模拟并广播一笔 Aqua registry `multicall([ship...])`。任一子调用失败时整批回滚，不会部分创建；成功后逐策略复核 `Shipped`、`Pushed` 和 `rawBalances`。approve 仍保持顺序发送，multicall raw 广播失败不会自动重发。
+当 `positions` 数量不少于 2 时，所有仓位完成单笔 ship 模拟并按 token 汇总余额后，会再模拟并广播一笔 Aqua registry `multicall([ship...])`。任一子调用失败时整批回滚，不会部分创建；成功后逐策略复核 `Shipped`、`Pushed` 和 `rawBalances`。approve 仍保持顺序发送，multicall raw 广播失败不会自动重发。
 
 ## LP 只读价格检查
 

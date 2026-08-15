@@ -14,7 +14,7 @@ import {
 import { createPublicClient, defineChain, http, isAddress, type Address, type Chain, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "../../scripts/encrypt-private-key.ts";
-import { buildAquaMulticallTransaction } from "../aqua/multicall.ts";
+import { buildAquaMulticallTransaction, shouldUseAquaMulticall } from "../aqua/multicall.ts";
 import { buildConcentratedStrategy } from "../aqua/strategy.ts";
 import { readJsoncFile } from "../config/jsonc.ts";
 import { validateAddLpConfig, type PositionConfig } from "../config/lp-config.ts";
@@ -395,8 +395,8 @@ async function main(): Promise<void> {
     if (!code || code === "0x") throw new Error(`Aqua registry=${registry} 未检测到合约代码`);
     logger.info(`RPC 与 Aqua registry 校验成功：chainId=${rpcChainId}，registry=${registry}`);
 
-    const batchShip = config.positions.length > 2;
-    if (batchShip) logger.info(`仓位数=${config.positions.length} > 2，启用单笔 atomic multicall ship${dryRun ? " dry-run 模拟" : ""}；任一子调用失败会整批回滚`);
+    const batchShip = shouldUseAquaMulticall(config.positions.length);
+    if (batchShip) logger.info(`仓位数=${config.positions.length} >= 2，启用单笔 atomic multicall ship${dryRun ? " dry-run 模拟" : ""}；任一子调用失败会整批回滚`);
     const preparedShips: PreparedShip[] = [];
     for (const [index, position] of config.positions.entries()) {
       const prepared = await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger, batchShip });
