@@ -21,7 +21,7 @@ import { readTokenState } from "../infra/erc20.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { RebalanceTerminalDashboard, type DashboardStatus, type RebalanceDashboardRow } from "../infra/rebalance-terminal.ts";
-import { sendLocallySignedTransaction } from "../infra/rpc.ts";
+import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
 import { acquireRebalanceLock, loadRebalanceState, saveRebalanceState, type PersistedPlan, type StateDocument } from "../infra/rebalance-state.ts";
 import { ensureMaximumAllowance } from "./add-lp.ts";
 
@@ -42,6 +42,19 @@ function readRpcUrl(): string {
 }
 function maskRpcUrl(value: string): string { try { const url = new URL(value); return `${url.protocol}//${url.host}`; } catch { return "无效 RPC URL"; } }
 function requireAddress(value: string, field: string): Address { if (!isAddress(value)) throw new Error(`${field} 不是有效 EVM 地址`); return value; }
+
+/** 网络超时后只使用本地 hash 等待同一笔回执，禁止为 dock/ship 再发送一次 raw transaction。 */
+async function sendOrReconcileBroadcast(parameters: { account: PrivateKeyAccount; chain: Chain; rpcUrl: string; transaction: TransactionRequest; logger: Logger; action: string }): Promise<Hex> {
+  try {
+    return await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), parameters.transaction);
+  } catch (error) {
+    if (error instanceof RawBroadcastIndeterminateError) {
+      parameters.logger.info(`${parameters.action} raw 广播响应不确定：本地交易哈希=${error.transactionHash}；不重发，改为查询同一笔回执`);
+      return error.transactionHash;
+    }
+    throw error;
+  }
+}
 
 /**
  * 解释策略为何不能进入自动处理。官方 status=open 会包含多种分类状态；illiquidity 的交易语义尚未由真实接口或 SDK 确认，必须保守阻止自动 dock/ship。
@@ -253,7 +266,7 @@ async function executeDock(parameters: { plan: PersistedPlan; state: StateDocume
   await parameters.client.call({ account: parameters.account.address, to, data, value: dock.value });
   parameters.logger.info(`dock 链上模拟成功：strategyHash=${plan.sourceStrategyHash}`);
   plan = { ...plan, stage: "DOCK_SENT", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config);
-  const transactionHash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), { to, data, value: dock.value });
+  const transactionHash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: { to, data, value: dock.value }, logger: parameters.logger, action: `dock strategyHash=${plan.sourceStrategyHash}` });
   plan = { ...plan, dockTransactionHash: transactionHash, updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`dock 已广播：strategyHash=${plan.sourceStrategyHash}，交易哈希=${transactionHash}`);
   const receipt = await parameters.client.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 }); if (receipt.status !== "success") throw new Error(`dock 回执失败：${transactionHash}`);
   const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>; if (!hasEvent(logs, parameters.registry, parameters.account.address, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, "docked")) throw new Error("dock 回执缺少匹配 Docked 事件");
@@ -332,7 +345,7 @@ async function executeShip(parameters: { plan: PersistedPlan; state: StateDocume
   parameters.logger.info(`ship 链上模拟成功：strategyHash=${built.strategyHash}`);
   plan = { ...frozen, stage: "SHIP_SENT", updatedAt: Date.now() };
   updatePlan(parameters.state, plan, parameters.config);
-  const transactionHash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), built.ship);
+  const transactionHash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: built.ship, logger: parameters.logger, action: `ship strategyHash=${built.strategyHash}` });
   plan = { ...plan, shipTransactionHash: transactionHash, updatedAt: Date.now() };
   updatePlan(parameters.state, plan, parameters.config);
   parameters.logger.info(`ship 已广播：strategyHash=${built.strategyHash}，交易哈希=${transactionHash}`);

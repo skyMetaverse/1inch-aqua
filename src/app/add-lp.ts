@@ -32,7 +32,7 @@ import {
 import { getCurrentPrice } from "../infra/emsh.ts";
 import { ERC20_ABI, buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
-import { sendLocallySignedTransaction } from "../infra/rpc.ts";
+import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
 
 const DEFAULT_CONFIG_PATH = "config/lp.add.jsonc";
 const ENV_FILE = ".env";
@@ -75,6 +75,21 @@ function maskRpcUrl(rpcUrl: string): string {
 function requireAddress(value: string, fieldName: string): Address {
   if (!isAddress(value)) throw new Error(`${fieldName} 不是有效 EVM 地址`);
   return value;
+}
+
+/**
+ * 超时等网络错误无法说明 raw 是否被节点接收。此处绝不重发，而是返回本地签名可确定的 hash，让后续既有 receipt 校验确认真实结果。
+ */
+async function sendOrReconcileBroadcast(parameters: { account: ReturnType<typeof privateKeyToAccount>; chain: Chain; rpcUrl: string; transaction: TransactionRequest; logger: Logger; action: string }): Promise<Hex> {
+  try {
+    return await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), parameters.transaction);
+  } catch (error) {
+    if (error instanceof RawBroadcastIndeterminateError) {
+      parameters.logger.info(`${parameters.action} raw 广播响应不确定：本地交易哈希=${error.transactionHash}；不重发，改为查询同一笔回执`);
+      return error.transactionHash;
+    }
+    throw error;
+  }
 }
 
 /** 解析 CLI，仅允许一个配置路径和可选 --dry-run，避免静默忽略错误参数。 */
@@ -150,11 +165,7 @@ export async function ensureMaximumAllowance(parameters: {
       }
       continue;
     }
-    const hash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), {
-      to: parameters.token,
-      data: step.data,
-      value: 0n,
-    });
+    const hash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: { to: parameters.token, data: step.data, value: 0n }, logger: parameters.logger, action: `token=${parameters.token} approve` });
     parameters.logger.info(`token=${parameters.token} approve 已广播：交易哈希=${hash}`);
     const receipt = await parameters.publicClient.waitForTransactionReceipt({ hash, confirmations: 1 });
     parameters.logger.info(`token=${parameters.token} approve 已确认：状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
@@ -279,7 +290,7 @@ async function addPosition(parameters: {
     return undefined;
   }
 
-  const hash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), built.ship);
+  const hash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: built.ship, logger: parameters.logger, action: `ship strategyHash=${built.strategyHash}` });
   await verifyShipReceipt({ ...parameters, built, tokens: [token0, token1], amounts: [amount0, amount1], hash });
   return undefined;
 }
@@ -360,7 +371,7 @@ async function broadcastPreparedShips(parameters: {
     parameters.logger.info(`dry-run：未广播 multicall ship，子调用数=${parameters.ships.length}`);
     return;
   }
-  const hash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), multicall);
+  const hash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: multicall, logger: parameters.logger, action: `批量 multicall ship 子调用数=${parameters.ships.length}` });
   parameters.logger.info(`批量 multicall ship 已广播：子调用数=${parameters.ships.length}，交易哈希=${hash}`);
   // 同一原子 receipt 必须逐策略复核，确保不能把“整笔成功”误认为所有 ship 都完整落链。
   for (const ship of parameters.ships) {

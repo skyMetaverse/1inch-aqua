@@ -4,7 +4,7 @@
  * 主要流程：读取 pending nonce/gas/最新区块 base fee -> 应用 .env 或 RPC 的 EIP-1559 fee -> 本地账户签名 -> eth_sendRawTransaction 广播；禁止裸地址账户触发节点代签。
  */
 import { readFileSync } from "node:fs";
-import { createPublicClient, type Address, type Chain, type Hex, type Transport } from "viem";
+import { createPublicClient, keccak256, type Address, type Chain, type Hex, type Transport } from "viem";
 import type { PrivateKeyAccount } from "viem/accounts";
 
 export interface TransactionRequest {
@@ -20,6 +20,16 @@ export interface TransactionRequest {
 export interface BatchBroadcastResult {
   hash?: Hex;
   error?: string;
+}
+
+/**
+ * raw 广播的 HTTP 响应不确定时返回本地可验证交易 hash。节点可能已接收交易但未及时响应；调用方必须只读查询该 hash，严禁重发 raw transaction。
+ */
+export class RawBroadcastIndeterminateError extends Error {
+  constructor(readonly transactionHash: Hex, reason: string) {
+    super(`raw 广播响应不确定：本地交易哈希=${transactionHash}，原因=${reason}`);
+    this.name = "RawBroadcastIndeterminateError";
+  }
 }
 
 /** .env 中可选的 EIP-1559 绝对费率上限；单位转换后始终使用 wei。 */
@@ -98,6 +108,12 @@ function firstErrorLine(error: unknown): string {
   }
   // 优先选择不是 viem 通用包装文本的节点原因；没有更具体信息时才回退到第一条。
   return messages.find((message) => !/^An unknown RPC error occurred\.?$/i.test(message)) ?? messages[0] ?? "未知错误";
+}
+
+/** 仅将网络级无响应归为不确定结果；合约、nonce、fee 或参数拒绝仍是确定失败，不能伪装成已广播。 */
+function isIndeterminateBroadcastError(error: unknown): boolean {
+  const message = firstErrorLine(error);
+  return /(timed?\s*out|timeout|network error|fetch failed|socket hang up|econnreset|connection reset|connection aborted)/i.test(message);
 }
 
 interface Eip1559Fees {
@@ -216,7 +232,12 @@ export async function sendLocallySignedTransaction(
     // raw 广播一旦得到网络级错误，节点接收状态不可假设；禁止自动重试，交由调用方只读确认后决定下一次操作。
     return await publicClient.request({ method: "eth_sendRawTransaction", params: [serialized] }, { retryCount: 0 });
   } catch (error) {
-    throw new Error(`raw 广播失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${fees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${fees.maxPriorityFeePerGas ?? "unknown"}，原因=${firstErrorLine(error)}`);
+    const reason = firstErrorLine(error);
+    if (isIndeterminateBroadcastError(error)) {
+      // 已签名 raw 的 keccak256 是节点应返回的交易 hash；只提供查询锚点，不代表可安全重发。
+      throw new RawBroadcastIndeterminateError(keccak256(serialized), reason);
+    }
+    throw new Error(`raw 广播失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${fees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${fees.maxPriorityFeePerGas ?? "unknown"}，原因=${reason}`);
   }
 }
 

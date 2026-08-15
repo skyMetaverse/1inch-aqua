@@ -28,7 +28,7 @@ import {
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { getDecryptedPrivateKey } from "./encrypt-private-key.ts";
 import { buildAquaMulticallTransaction, shouldUseAquaMulticall } from "../src/aqua/multicall.ts";
-import { sendLocallySignedTransaction } from "../src/infra/rpc.ts";
+import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../src/infra/rpc.ts";
 
 const ENV_FILE = ".env";
 const RPC_URL_FIELD = "RPC_URL";
@@ -137,6 +137,19 @@ function maskRpcUrl(rpcUrl: string): string {
     return `${parsed.protocol}//${parsed.host}`;
   } catch {
     return "无效 RPC URL";
+  }
+}
+
+/** 网络级超时只允许用本地 hash 等待同一笔 dock 回执，禁止再次广播导致重复关闭或 nonce 冲突。 */
+async function sendOrReconcileBroadcast(parameters: { account: PrivateKeyAccount; chain: Chain; rpcUrl: string; transaction: TransactionRequest; logger: Logger; action: string }): Promise<Hex> {
+  try {
+    return await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), parameters.transaction);
+  } catch (error) {
+    if (error instanceof RawBroadcastIndeterminateError) {
+      parameters.logger.info(`${parameters.action} raw 广播响应不确定：本地交易哈希=${error.transactionHash}；不重发，改为查询同一笔回执`);
+      return error.transactionHash;
+    }
+    throw error;
   }
 }
 
@@ -408,14 +421,7 @@ async function cancelStrategy(
     return;
   }
 
-  let transactionHash: Hex;
-  try {
-    transactionHash = await sendLocallySignedTransaction(account, chain, http(rpcUrl), prepared.dock);
-  } catch (error) {
-    // viem 的完整错误可能包含 RPC URL 和 calldata；日志只保留首行可复盘原因，避免扩散敏感 RPC 信息。
-    const reason = error instanceof Error ? error.message.split("\n")[0]?.trim() : "未知 RPC 错误";
-    throw new Error(`dock 本地签名广播失败：${reason || "未知 RPC 错误"}`);
-  }
+  const transactionHash = await sendOrReconcileBroadcast({ account, chain, rpcUrl, transaction: prepared.dock, logger, action: `dock strategyHash=${prepared.strategyHash}` });
   logger.info(`dock 交易已广播：strategyHash=${prepared.strategyHash}，交易哈希=${transactionHash}`);
   const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 });
   logger.info(`dock 交易已确认：strategyHash=${prepared.strategyHash}，状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);
@@ -458,13 +464,7 @@ async function cancelStrategiesWithMulticall(parameters: {
     return;
   }
 
-  let transactionHash: Hex;
-  try {
-    transactionHash = await sendLocallySignedTransaction(parameters.account, parameters.chain, http(parameters.rpcUrl), multicall);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message.split("\n")[0]?.trim() : "未知 RPC 错误";
-    throw new Error(`multicall dock 本地签名广播失败：${reason || "未知 RPC 错误"}`);
-  }
+  const transactionHash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: multicall, logger: parameters.logger, action: `批量 multicall dock 子调用数=${prepared.length}` });
   parameters.logger.info(`批量 multicall dock 已广播：子调用数=${prepared.length}，交易哈希=${transactionHash}`);
   const receipt = await parameters.publicClient.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 });
   parameters.logger.info(`批量 multicall dock 已确认：状态=${receipt.status}，区块=${receipt.blockNumber.toString()}`);

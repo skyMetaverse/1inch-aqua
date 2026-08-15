@@ -5,9 +5,9 @@
  */
 
 import { expect, test } from "bun:test";
-import { custom, defineChain, parseTransaction, type Hex } from "viem";
+import { custom, defineChain, keccak256, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { parseEip1559FeeOverrides, sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
+import { parseEip1559FeeOverrides, RawBroadcastIndeterminateError, sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
 
 /** 测试专用链定义；不连接公共 RPC，也不携带任何真实账户或真实节点信息。 */
 const testChain = defineChain({
@@ -106,6 +106,32 @@ test("raw 广播拒绝时记录阶段和安全交易参数，不自动重试", a
     value: 0n,
   }, {})).rejects.toThrow("raw 广播失败：nonce=12，gas=100000，maxFeePerGas=2200000000，maxPriorityFeePerGas=1000000000，原因=Missing or invalid parameters.");
   expect(rawRequestCount).toBe(1);
+  expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
+});
+
+/** HTTP 超时不等于节点未接收 raw；共享层必须给出本地 hash 供调用方只读查回执，且绝不重发。 */
+test("raw 广播超时返回本地可验证交易哈希", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0xe";
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x3b9aca00";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" } as unknown as Hex;
+      if (args.method === "eth_sendRawTransaction") throw new Error("The request timed out.");
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  let caught: unknown;
+  try {
+    await sendLocallySignedTransaction(testAccount, testChain, transport, { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x28defc17", value: 0n }, {});
+  } catch (error) {
+    caught = error;
+  }
+  const raw = requests.find((request) => request.method === "eth_sendRawTransaction")?.params?.[0] as Hex;
+  expect(caught).toBeInstanceOf(RawBroadcastIndeterminateError);
+  expect((caught as RawBroadcastIndeterminateError).transactionHash).toBe(keccak256(raw));
   expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
 });
 
