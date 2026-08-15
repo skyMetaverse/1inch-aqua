@@ -4,7 +4,7 @@
  * 主要流程：构造确定性 allowance 与所需投入 -> 生成 approve 步骤 -> 断言覆盖判断、目标额度和通用兼容分支。
  */
 import { expect, test } from "bun:test";
-import { buildMaximumApprovalSteps, hasSufficientAllowance, MAX_UINT256, readTokenState } from "../src/infra/erc20.ts";
+import { buildMaximumApprovalSteps, hasSufficientAllowance, MAX_UINT256, readTokenAllowance, readTokenBalance, readTokenState } from "../src/infra/erc20.ts";
 
 const registry = "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a" as const;
 const UINT96_MAX = (1n << 96n) - 1n;
@@ -60,6 +60,26 @@ test("token 状态读取按顺序执行并在临时限流后重试", async () =>
   const state = await readTokenState(client, "0x111111111117dc0aa78b770fa6a738034120c302", "0x01162202AC4A4C686FE95B946E4833b8869CF961", registry, 0);
   expect(state).toEqual({ decimals: 18, balance: 42n, allowance: 84n });
   expect(calls).toEqual(["decimals", "balanceOf", "balanceOf", "allowance"]);
+});
+
+/** 已确认最大授权时 ship 仍必须读余额，但不得产生新的 allowance RPC。 */
+test("余额与授权读取可分离，最大授权缓存路径仅需余额", async () => {
+  const calls: string[] = [];
+  const client = {
+    async readContract(parameters: unknown): Promise<unknown> {
+      const functionName = (parameters as { functionName: string }).functionName;
+      calls.push(functionName);
+      if (functionName === "balanceOf") return 42n;
+      if (functionName === "allowance") return MAX_UINT256;
+      throw new Error("未预期的读取函数");
+    },
+  };
+  const token = "0x111111111117dc0aa78b770fa6a738034120c302" as const;
+  const owner = "0x01162202AC4A4C686FE95B946E4833b8869CF961" as const;
+  expect(await readTokenBalance(client, token, owner, 0)).toBe(42n);
+  expect(calls).toEqual(["balanceOf"]);
+  expect(await readTokenAllowance(client, token, owner, registry, 0)).toBe(MAX_UINT256);
+  expect(calls).toEqual(["balanceOf", "allowance"]);
 });
 
 test("token 状态读取重试后仍失败时终止", async () => {

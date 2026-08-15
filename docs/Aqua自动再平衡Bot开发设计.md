@@ -40,7 +40,7 @@ GET https://proxy-app.1inch.com/v2.0/aqua/v1.0/strategies/makers/{maker}
   &chainId={chainId}
 ```
 
-请求需先调用 `GET /v2.0/auth/token` 获取 Bearer token，并使用 1inch 网页端一致的 `referer`、`user-agent` 和 `accept-language` 请求头。
+请求需先调用 `GET /v2.0/auth/token` 获取 Bearer JWT，并使用 1inch 网页端一致的 `referer`、`user-agent` 和 `accept-language` 请求头。运行时解析 JWT `exp`，由策略、Pair 与 EMSH 请求共享进程内 token，到期前 60 秒才刷新；并发请求合并为一次认证调用，不按 30 秒轮询重复请求。
 
 已实际观测的响应包含：
 
@@ -123,7 +123,7 @@ RPC 不参与“是否重挂、重挂成什么模式”的业务决策，不按�
 3. 模拟 `dock`。
 4. 广播后校验 receipt、`Docked` 事件和 docked 状态。
 5. `dock` 已确认后读取钱包两个 ERC20 的实际余额；以 API 决定的模式导出最终投入额，并原子持久化 wallet snapshot、amounts、salt 和新 hash。
-6. `ship` 前再次读取钱包余额、decimals、allowance，只验证已冻结金额并按已有通用兼容逻辑授权，不得改变计划金额。
+6. `ship` 前再次读取钱包余额，只验证已冻结金额，不得改变计划金额；启动预检已确认精确 `MAX_UINT256` 的 token 在当前进程跳过 allowance 读取，其他 token 仍按已有通用兼容逻辑核对并授权。
 7. 模拟并广播 `ship`；校验 receipt、`Shipped`、非零 `Pushed` 与新的 `rawBalances`。
 
 若 API 快照与 dock 前预检链上余额不一致，计划立即失效；Bot 重新拉取 API，不使用链上余额改变模式。dock 确认后，钱包余额是新策略资金来源；一经冻结为 SHIP_PREPARED，后续余额变化不得改变该次投入数量。
@@ -403,8 +403,8 @@ shipTransactionHash?
 ### 8.2 ship
 
 1. 从已持久化计划读取目标 token raw amount 和精确 sqrt 价格区间；不得重新根据链上余额改变计划。
-2. 查询钱包 ERC20 balance、decimals、allowance，确认计划金额可用。
-3. 对每个非零投入 token 使用已有通用授权流程：不足则非零 allowance 先清零，再尝试 `approve(MAX_UINT256)`，以回读 allowance 覆盖本次投入为成功条件。
+2. 查询钱包 ERC20 balance，确认计划金额可用；仅当启动预检未确认该 token 为 `MAX_UINT256` 时才查询 allowance。
+3. 对每个未缓存最大授权的非零投入 token 使用已有通用授权流程：不足则非零 allowance 先清零，再尝试 `approve(MAX_UINT256)`，以回读 allowance 覆盖本次投入为成功条件；精确 `MAX_UINT256` 仅缓存于当前进程，不写入 state 文件。
 4. 使用现有 `buildConcentratedStrategy()`，每次生成随机 uint64 salt 与新 hash。
 5. 先 `eth_call` 模拟 ship，再本地签名广播。
 6. 校验 receipt、`Shipped`，每个非零 token 的 `Pushed`，以及新 hash 的 rawBalances。

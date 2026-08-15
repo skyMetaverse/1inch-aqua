@@ -4,6 +4,7 @@
  * 主要流程：复用浏览器指纹 transport -> 获取短期 Bearer token -> 请求 API -> 规范化为 Bot 快照。
  */
 import { createTransport, fetch, type Transport } from "wreq-js";
+import { getOneInchAuthToken } from "./oneinch-auth.ts";
 import { isAddress, type Address, type Hex } from "viem";
 
 const BASE_URL = "https://proxy-app.1inch.com/v2.0";
@@ -55,11 +56,9 @@ export function parsePairMarket(value: unknown): PairMarket {
   return { token0: address(item.token0, "Pair token0"), token1: address(item.token1, "Pair token1"), lastPrice: finite(item.lastPrice, "Pair lastPrice", false), volumeUsd: finite(item.volumeUsd, "Pair volumeUsd"), swaps: integer(item.swaps, "Pair swaps"), diffPercent1h: signedFinite(item.diffPercent1h, "Pair diffPercent1h"), diffPercent24h: signedFinite(item.diffPercent24h, "Pair diffPercent24h"), diffPercent7d: signedFinite(item.diffPercent7d, "Pair diffPercent7d") };
 }
 
-async function authToken(): Promise<string> { const response = await fetch(`${BASE_URL}/auth/token`, { transport: await getTransport(), headers: headers(), method: "GET" }); if (response.status !== 200) throw new Error(`获取 1inch API 认证 token 失败：HTTP ${response.status}`); const data = record(await response.json(), "认证响应"); if (typeof data.access_token !== "string" || data.access_token === "") throw new Error("认证响应缺少 access_token"); return data.access_token; }
-
 /** 获取 maker 全部 open 策略；未知 cursor 语义时拒绝继续，绝不漏监控后自动交易。 */
 export async function getActiveStrategies(maker: Address, chainId: number): Promise<ApiStrategy[]> {
-  const token = await authToken(); const query = new URLSearchParams({ status: "open", limit: String(PAGE_SIZE), chainId: String(chainId) });
+  const token = await getOneInchAuthToken(); const query = new URLSearchParams({ status: "open", limit: String(PAGE_SIZE), chainId: String(chainId) });
   const response = await fetch(`${BASE_URL}/aqua/v1.0/strategies/makers/${maker}?${query}`, { transport: await getTransport(), headers: headers(token), method: "GET" });
   if (response.status !== 200) throw new Error(`查询活跃 LP 仓位失败：HTTP ${response.status}`);
   const data = record(await response.json(), "策略响应"); if (!Array.isArray(data.items)) throw new Error("策略响应缺少 items 数组");
@@ -71,7 +70,7 @@ export async function getActiveStrategies(maker: Address, chainId: number): Prom
 /** 批量查询 Pair 市场数据；响应必须与请求 pair 一一对应，防止错配市场阈值。 */
 export async function getPairMarkets(chainId: number, pairs: Array<[Address, Address]>): Promise<PairMarket[]> {
   if (pairs.length === 0) return [];
-  const token = await authToken(); const response = await fetch(`${BASE_URL}/bff/v1.0/tokens-market/${chainId}/pair`, { transport: await getTransport(), headers: { ...headers(token), "content-type": "application/json" }, method: "POST", body: JSON.stringify({ pairs }) });
+  const token = await getOneInchAuthToken(); const response = await fetch(`${BASE_URL}/bff/v1.0/tokens-market/${chainId}/pair`, { transport: await getTransport(), headers: { ...headers(token), "content-type": "application/json" }, method: "POST", body: JSON.stringify({ pairs }) });
   if (response.status !== 200 && response.status !== 201) throw new Error(`查询 Pair 市场失败：HTTP ${response.status}`);
   const data = await response.json(); if (!Array.isArray(data) || data.length !== pairs.length) throw new Error("Pair 市场响应数量与请求不一致");
   const result = data.map(parsePairMarket);

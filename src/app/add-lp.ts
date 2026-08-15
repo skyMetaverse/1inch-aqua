@@ -142,7 +142,7 @@ export async function ensureMaximumAllowance(parameters: {
   requiredAmount: bigint;
   dryRun: boolean;
   logger: Logger;
-}): Promise<void> {
+}): Promise<bigint> {
   const steps = buildMaximumApprovalSteps(
     parameters.initialAllowance,
     parameters.requiredAmount,
@@ -150,7 +150,7 @@ export async function ensureMaximumAllowance(parameters: {
   );
   if (steps.length === 0) {
     parameters.logger.info(`token=${parameters.token} 当前授权已覆盖本次投入，无需 approve：allowance=${parameters.initialAllowance.toString()}，所需=${parameters.requiredAmount.toString()}`);
-    return;
+    return parameters.initialAllowance;
   }
 
   for (const [index, step] of steps.entries()) {
@@ -183,7 +183,11 @@ export async function ensureMaximumAllowance(parameters: {
       throw new Error(`token=${parameters.token} 授权复查失败：实际=${allowance.toString()}，本次所需=${parameters.requiredAmount.toString()}`);
     }
     parameters.logger.info(`token=${parameters.token} 授权复查成功：实际=${allowance.toString()}，本次所需=${parameters.requiredAmount.toString()}`);
+    return allowance;
   }
+
+  // dry-run 不会改变链上状态，返回输入额度仅供调用方保持无副作用的预览流程。
+  return parameters.initialAllowance;
 }
 
 /** 解析并验证 ship receipt 中的目标 Shipped 事件。 */

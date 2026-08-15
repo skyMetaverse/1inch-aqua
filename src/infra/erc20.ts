@@ -22,6 +22,39 @@ export interface TokenState {
   allowance: bigint;
 }
 
+/** 读取钱包余额；重挂前必须实时读取，因为 dock 或用户转账会改变可投入资金。 */
+export async function readTokenBalance(
+  publicClient: { readContract(parameters: unknown): Promise<unknown> },
+  token: Address,
+  owner: Address,
+  retryDelayMs = READ_RETRY_DELAY_MS,
+): Promise<bigint> {
+  const balance = await readWithRetry(
+    () => publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [owner] }),
+    token,
+    "balanceOf",
+    retryDelayMs,
+  );
+  return BigInt(balance as bigint);
+}
+
+/** 读取链上 allowance；仅在启动预检或进程内未确认最大授权时调用，不能使用持久化旧值。 */
+export async function readTokenAllowance(
+  publicClient: { readContract(parameters: unknown): Promise<unknown> },
+  token: Address,
+  owner: Address,
+  spender: Address,
+  retryDelayMs = READ_RETRY_DELAY_MS,
+): Promise<bigint> {
+  const allowance = await readWithRetry(
+    () => publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "allowance", args: [owner, spender] }),
+    token,
+    "allowance",
+    retryDelayMs,
+  );
+  return BigInt(allowance as bigint);
+}
+
 /**
  * 对单个 RPC 读取进行有限重试。
  * 公共 RPC 可能短暂限流或网络抖动；重试后仍失败必须中止，不能用旧余额或猜测额度继续广播。

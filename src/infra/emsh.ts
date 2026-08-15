@@ -4,6 +4,7 @@
  * 主要流程：获取 Bearer token -> 使用 wreq-js 请求 current -> 校验响应 -> 返回精确价格文本、接口时间戳和请求耗时。
  */
 import { createTransport, fetch, type Transport } from "wreq-js";
+import { getOneInchAuthToken } from "./oneinch-auth.ts";
 
 const BASE_URL = "https://proxy-app.1inch.com/v2.0";
 const BROWSER = "chrome_149";
@@ -34,15 +35,6 @@ function headers(token?: string): Record<string, string> {
   return result;
 }
 
-async function getAuthToken(): Promise<string> {
-  const response = await fetch(`${BASE_URL}/auth/token`, { transport: await getTransport(), headers: headers(), method: "GET" });
-  if (response.status !== 200) throw new Error(`获取 EMSH API 认证 token 失败：HTTP ${response.status}`);
-  const raw = await response.text();
-  const match = raw.match(/"access_token"\s*:\s*"([^"\\]+)"/);
-  if (!match?.[1]) throw new Error("EMSH API 认证响应缺少 access_token");
-  return match[1];
-}
-
 /**
  * 从 current 原始 JSON 文本提取价格字面量和时间戳。
  * 不使用 JSON.parse，确保服务端写出的长小数不会被客户端先变成 JavaScript Number。
@@ -63,7 +55,7 @@ export function extractCurrentPrice(rawResponse: string): { priceText: string; t
  */
 export async function getCurrentPrice(token0: string, token1: string, chainId: number): Promise<CurrentPrice> {
   const start = Date.now();
-  const token = await getAuthToken();
+  const token = await getOneInchAuthToken();
   const response = await fetch(
     `${BASE_URL}/charts/v1.0/chart/tradingview/${token0}/${token1}/86400/${chainId}/current`,
     { transport: await getTransport(), headers: headers(token), method: "GET" },

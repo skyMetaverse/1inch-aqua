@@ -17,7 +17,7 @@ import { readJsoncFile } from "../config/jsonc.ts";
 import { calculateDisplayRange, convertAquaSqrtRangeToDisplayRange, convertDisplayRangeToAquaSqrtRange, formatFixed, parseDecimal, parseDecimalFloor, parsePercentage, percentageToAquaFeeValue } from "../domain/fixed.ts";
 import { decideRebalance, outsideDistancePercent, relativePriceDeviationPercent, type RebalanceMode } from "../domain/rebalance.ts";
 import { getActiveStrategies, getPairMarkets, type ApiStrategy, type PairMarket } from "../infra/aqua-api.ts";
-import { readTokenState } from "../infra/erc20.ts";
+import { MAX_UINT256, readTokenAllowance, readTokenBalance } from "../infra/erc20.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { RebalanceTerminalDashboard, type DashboardStatus, type RebalanceDashboardRow } from "../infra/rebalance-terminal.ts";
@@ -102,6 +102,29 @@ type LogicalPositionInput = { chainId: number; maker: Address; app: Address; tok
 export function buildLogicalPositionKey(parameters: LogicalPositionInput): string { return `${positionIdentity(parameters)}:${parameters.strategyHash.toLowerCase()}`; }
 function logicalKey(strategy: ApiStrategy): string { return buildLogicalPositionKey(strategy); }
 function keyWithStrategyHash(key: string, strategyHash: string): string { return `${key.replace(/:0x[0-9a-f]{64}$/i, "")}:${strategyHash.toLowerCase()}`; }
+
+/** 授权缓存只在当前进程有效，key 绑定 owner、registry 和 token；重启或链上未确认最大授权时都必须重新读取。 */
+function maximumAllowanceCacheKey(owner: Address, registry: Address, token: Address): string {
+  return `${owner.toLowerCase()}:${registry.toLowerCase()}:${token.toLowerCase()}`;
+}
+
+/** 启动后一次性预检当前 open 策略涉及的 token；精确 MAX_UINT256 才可对任意后续投入额跳过 allowance 读取。 */
+async function primeMaximumAllowanceCache(parameters: { client: ReturnType<typeof createPublicClient>; strategies: readonly ApiStrategy[]; owner: Address; registry: Address; cache: Set<string>; logger: Logger }): Promise<void> {
+  const tokens = new Map<string, Address>();
+  for (const strategy of parameters.strategies) {
+    for (const token of strategy.tokens) tokens.set(token.address.toLowerCase(), token.address);
+  }
+  for (const token of tokens.values()) {
+    const allowance = await readTokenAllowance(parameters.client, token, parameters.owner, parameters.registry);
+    const cacheKey = maximumAllowanceCacheKey(parameters.owner, parameters.registry, token);
+    if (allowance === MAX_UINT256) {
+      parameters.cache.add(cacheKey);
+      parameters.logger.info(`启动授权预检：token=${token} 已确认 MAX_UINT256，后续本进程重挂不再读取 allowance`);
+    } else {
+      parameters.logger.info(`启动授权预检：token=${token} 非最大授权，ship 前仍需核对 allowance=${allowance.toString()}`);
+    }
+  }
+}
 
 /** 将旧版不含 strategyHash 的状态 key 迁移到当前独立仓位 key，避免升级后丢失恢复计划。 */
 function migrateStateKeys(state: StateDocument): boolean {
@@ -298,9 +321,9 @@ async function prepareShipFromWallet(parameters: { plan: PersistedPlan; state: S
   const token0 = requireAddress(parameters.plan.tokens[0], "计划 token0");
   const token1 = requireAddress(parameters.plan.tokens[1], "计划 token1");
   // 保持串行读取，沿用低额度 RPC 的限流保护；这两个余额是新策略唯一的资金来源快照。
-  const state0 = await readTokenState(parameters.client, token0, parameters.account.address, parameters.registry);
-  const state1 = await readTokenState(parameters.client, token1, parameters.account.address, parameters.registry);
-  const walletBalances: [bigint, bigint] = [state0.balance, state1.balance];
+  const balance0 = await readTokenBalance(parameters.client, token0, parameters.account.address);
+  const balance1 = await readTokenBalance(parameters.client, token1, parameters.account.address);
+  const walletBalances: [bigint, bigint] = [balance0, balance1];
   const amounts = deriveWalletShipAmounts(walletBalances, parameters.plan.targetMode);
   const salt = BigInt(`0x${randomBytes(8).toString("hex")}`);
   const built = buildConcentratedStrategy({ chainId: parameters.chainId, maker: parameters.account.address, sqrtPriceMin: BigInt(parameters.plan.targetSqrtPriceMin), sqrtPriceMax: BigInt(parameters.plan.targetSqrtPriceMax), feeValue: percentageToAquaFeeValue(parsePercentage(parameters.plan.fee, "计划 fee")), amounts: [{ token: token0, amount: amounts[0] }, { token: token1, amount: amounts[1] }], salt });
@@ -313,7 +336,7 @@ async function prepareShipFromWallet(parameters: { plan: PersistedPlan; state: S
 }
 
 /** ship 仅使用 SHIP_PREPARED 已冻结的钱包金额；再次读取钱包只验证余额和 allowance，不能改变计划投入额。 */
-async function executeShip(parameters: { plan: PersistedPlan; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; registry: Address; account: PrivateKeyAccount; chain: Chain; chainId: number; rpcUrl: string; logger: Logger }): Promise<PersistedPlan> {
+async function executeShip(parameters: { plan: PersistedPlan; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; registry: Address; account: PrivateKeyAccount; chain: Chain; chainId: number; rpcUrl: string; logger: Logger; maximumAllowanceCache: Set<string> }): Promise<PersistedPlan> {
   let { plan } = parameters;
   if (plan.stage === "ACTIVE_LATEST") return plan;
   plan = await prepareShipFromWallet(parameters);
@@ -336,9 +359,17 @@ async function executeShip(parameters: { plan: PersistedPlan; state: StateDocume
   for (const [index, token] of frozen.tokens.entries()) {
     const amount = BigInt(frozen.targetAmountsRaw[index] ?? "");
     if (amount === 0n) continue;
-    const tokenState = await readTokenState(parameters.client, requireAddress(token, "计划 token"), parameters.account.address, parameters.registry);
-    if (tokenState.balance < amount) throw new Error(`钱包余额不足以执行已冻结计划：token=${token}，余额=${tokenState.balance.toString()}，计划=${amount.toString()}`);
-    await ensureMaximumAllowance({ publicClient: parameters.client, account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, token: requireAddress(token, "计划 token"), registry: parameters.registry, initialAllowance: tokenState.allowance, requiredAmount: amount, dryRun: false, logger: parameters.logger });
+    const plannedToken = requireAddress(token, "计划 token");
+    const balance = await readTokenBalance(parameters.client, plannedToken, parameters.account.address);
+    if (balance < amount) throw new Error(`钱包余额不足以执行已冻结计划：token=${token}，余额=${balance.toString()}，计划=${amount.toString()}`);
+    const cacheKey = maximumAllowanceCacheKey(parameters.account.address, parameters.registry, plannedToken);
+    if (parameters.maximumAllowanceCache.has(cacheKey)) {
+      parameters.logger.info(`token=${plannedToken} 已由启动预检确认 MAX_UINT256，本进程跳过 allowance 检查`);
+      continue;
+    }
+    const allowance = await readTokenAllowance(parameters.client, plannedToken, parameters.account.address, parameters.registry);
+    const confirmedAllowance = await ensureMaximumAllowance({ publicClient: parameters.client, account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, token: plannedToken, registry: parameters.registry, initialAllowance: allowance, requiredAmount: amount, dryRun: false, logger: parameters.logger });
+    if (confirmedAllowance === MAX_UINT256) parameters.maximumAllowanceCache.add(cacheKey);
   }
   parameters.logger.info(`ship 使用已冻结的 dock 后钱包快照：strategyHash=${built.strategyHash}，token0 raw=${frozen.targetAmountsRaw[0]}，token1 raw=${frozen.targetAmountsRaw[1]}`);
   await parameters.client.call({ account: parameters.account.address, to: built.ship.to, data: built.ship.data, value: built.ship.value });
@@ -464,6 +495,9 @@ async function main(): Promise<void> {
     privateKey = await getDecryptedPrivateKey();
     const account = privateKeyToAccount(privateKey.toString("utf8") as Hex); const preliminary = createPublicClient({ transport: http(rpcUrl) }); const chainId = await preliminary.getChainId(); if (chainId !== config.chainId) throw new Error(`RPC chainId=${chainId} 与配置不一致`); const chain = defineChain({ id: chainId, name: `Aqua chain ${chainId}`, nativeCurrency: { name: "Native", symbol: "NATIVE", decimals: 18 }, rpcUrls: { default: { http: [rpcUrl] } } }); const client = createPublicClient({ chain, transport: http(rpcUrl) }); const registrySdk = AQUA_CONTRACT_ADDRESSES[chainId as NetworkEnum]; const appSdk = AQUA_SWAP_VM_CONTRACT_ADDRESSES[chainId as NetworkEnum]; if (!registrySdk || !appSdk) throw new Error(`SDK 不支持 chainId=${chainId}`); const registry = requireAddress(registrySdk.toString(), "Aqua registry"); const app = requireAddress(appSdk.toString(), "Aqua SwapVM app"); if (!await client.getCode({ address: registry })) throw new Error("Aqua registry 未检测到合约代码"); logger.info(`私钥解密与网络校验成功：maker=${account.address}，registry=${registry}，app=${app}`);
     const state = loadRebalanceState(config.runtime.stateFile);
+    // 仅进程内保存已确认最大授权；不写入 state 文件，避免外部 revoke 后跨重启仍错误跳过链上检查。
+    const maximumAllowanceCache = new Set<string>();
+    let allowancePreflightCompleted = false;
     if (migrateStateKeys(state)) {
       saveRebalanceState(config.runtime.stateFile, state);
       logger.info("已将旧版不含 strategyHash 的状态 key 迁移为独立仓位 key");
@@ -471,7 +505,7 @@ async function main(): Promise<void> {
     const execute = async (plan: PersistedPlan): Promise<void> => {
       try {
         const docked = await executeDock({ plan, state, config, client, registry, account, chain, rpcUrl, logger });
-        await executeShip({ plan: docked, state, config, client, registry, account, chain, chainId, rpcUrl, logger });
+        await executeShip({ plan: docked, state, config, client, registry, account, chain, chainId, rpcUrl, logger, maximumAllowanceCache });
       } catch (error) {
         const message = error instanceof Error ? error.message.split("\n")[0] || "未知错误" : "未知错误";
         if (message.startsWith("链上余额与 API 计划不一致")) {
@@ -500,6 +534,12 @@ async function main(): Promise<void> {
         }
         const strategies = await getActiveStrategies(account.address, chainId);
         logger.info(`官方策略 API 返回 open 仓位数=${strategies.length}`);
+        if (!allowancePreflightCompleted) {
+          const authorizationStrategies = strategies.filter((strategy) => unsupportedStrategyReason(strategy, account.address, config.chainId, app) === null);
+          await primeMaximumAllowanceCache({ client, strategies: authorizationStrategies, owner: account.address, registry, cache: maximumAllowanceCache, logger });
+          allowancePreflightCompleted = true;
+          logger.info(`启动授权预检完成：最大授权 token 数=${maximumAllowanceCache.size}`);
+        }
         await processSnapshot({ strategies, config, state, account, app, logger, terminal, execute });
         terminal.render();
       } catch (error) {

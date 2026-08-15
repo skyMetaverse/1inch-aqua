@@ -116,7 +116,7 @@ bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 confi
 
 ## 自动再平衡 Bot
 
-Bot 查询 1inch 官方策略 API `status=open` 返回的当前 maker 仓位，并自动处理受支持的 `classification.type=concentrated` 策略。`classification.state=active` 沿用连续越界、冷却期、Pair 最少 swaps 与 Pair/EMSH 价格交叉校验后重挂；`classification.state=illiquidity` 是强制重挂触发，会读取 EMSH current 构造新区间后直接执行受完整链上复核保护的 `dock -> ship`，不等待上述市场或冷却门槛。策略 API 的 `currentBalance` 用于 dock 前核对旧策略，EMSH current 用于计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足对应状态规则时直接广播交易。
+Bot 查询 1inch 官方策略 API `status=open` 返回的当前 maker 仓位，并自动处理受支持的 `classification.type=concentrated` 策略。1inch 的 `auth/token` JWT 只在进程启动时获取，Aqua 策略、Pair 与 EMSH current 共用内存缓存，并在 JWT `exp` 到期前 60 秒刷新；不会每 30 秒轮询或每个 current 请求一次。`classification.state=active` 沿用连续越界、冷却期、Pair 最少 swaps 与 Pair/EMSH 价格交叉校验后重挂；`classification.state=illiquidity` 是强制重挂触发，会读取 EMSH current 构造新区间后直接执行受完整链上复核保护的 `dock -> ship`，不等待上述市场或冷却门槛。策略 API 的 `currentBalance` 用于 dock 前核对旧策略，EMSH current 用于计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足对应状态规则时直接广播交易。
 
 先创建本地运行配置：
 
@@ -130,7 +130,7 @@ cp config/rebalance.example.jsonc config/rebalance.jsonc
 bun run rebalance-bot config/rebalance.jsonc
 ```
 
-Bot 自动处理当前 SDK 支持的两 token concentrated `active` 与 `illiquidity` 策略：`active` 按正常越界规则重挂，`illiquidity` 直接生成关闭重开计划；其他 open 状态仍显示为 BLOCK 并写入明确原因。API 的 `currentBalance.raw` 只用于 dock 前核对旧策略；dock 已确认后，Bot 会读取该 pair 两个 token 的实际钱包余额并冻结新策略资金：双边全额投入两侧钱包余额，单边只全额投入目标侧余额。因此钱包中同 token 的既有资产也会被纳入本次重挂，非目标侧单边余额会保留在钱包。冻结金额、salt 与新 hash 写入 state v3 后，即使余额随后变化也不会修改同一计划。EMSH current 无效、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含完整 current、完整旧区间、完整越界、连续次数、完整 Pair/EMSH 价差和决策状态；宽度不足时自动改用逐策略多行详情，关键数值绝不以省略号截断。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，v2 未发 ship 计划会升级为 v3 并在 dock 后重新冻结钱包余额。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
+Bot 自动处理当前 SDK 支持的两 token concentrated `active` 与 `illiquidity` 策略：`active` 按正常越界规则重挂，`illiquidity` 直接生成关闭重开计划；其他 open 状态仍显示为 BLOCK 并写入明确原因。API 的 `currentBalance.raw` 只用于 dock 前核对旧策略；dock 已确认后，Bot 会读取该 pair 两个 token 的实际钱包余额并冻结新策略资金：双边全额投入两侧钱包余额，单边只全额投入目标侧余额。因此钱包中同 token 的既有资产也会被纳入本次重挂，非目标侧单边余额会保留在钱包。启动时 Bot 会对当前受支持策略的 token 读取一次 `allowance(owner, registry)`；确认精确 `MAX_UINT256` 后只在内存中缓存，后续本进程 ship 仅读实时余额、不再重复读取 allowance。非最大授权、外部 revoke 或进程重启仍会链上核对。冻结金额、salt 与新 hash 写入 state v3 后，即使余额随后变化也不会修改同一计划。EMSH current 无效、API 快照与链上预检不一致或任一交易失败时，该仓位会停止自动处理并写中文日志；同一 pair 的多个 strategyHash 会分别监控、分别决策、分别保存状态。交互 TTY 默认显示原位刷新的对齐策略表和近期事件，包含完整 current、完整旧区间、完整越界、连续次数、完整 Pair/EMSH 价差和决策状态；宽度不足时自动改用逐策略多行详情，关键数值绝不以省略号截断。输出重定向、非 TTY 和 CI 自动回退为完整逐行日志，`logs/` 文件始终保存权威审计记录。计划使用 decimals-aware `sqrtPrice` 持久化与恢复；旧 v1 rawPrice 状态文件会被拒绝，v2 未发 ship 计划会升级为 v3 并在 dock 后重新冻结钱包余额。`dock` 已确认但 `ship` 未完成时，状态文件会保存同一策略计划，进程重启后优先恢复，避免重新生成冲突仓位。完整策略、恢复和风险边界见 [Aqua自动再平衡Bot开发设计.md](/Users/syskey/git/1inch-aqua/docs/Aqua自动再平衡Bot开发设计.md)。
 
 运行回归测试：
 
