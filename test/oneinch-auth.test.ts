@@ -37,6 +37,17 @@ test("并发获取即将过期 token 时合并为一次认证请求", async () =
   expect(requestCount).toBe(1);
 });
 
+test("服务端拒绝 token 后失效缓存并单次刷新", async () => {
+  let requestCount = 0;
+  const now = 1_700_000_000_000;
+  const cache = new ExpiringBearerTokenCache(async () => testJwt(Math.floor((now + 3_600_000) / 1000) + ++requestCount), () => now, 60_000);
+  const first = await cache.get();
+  cache.invalidate();
+  const refreshed = await cache.get();
+  expect(refreshed).not.toBe(first);
+  expect(requestCount).toBe(2);
+});
+
 test("缺少 exp 的认证 token 被拒绝，避免以猜测时长缓存", () => {
   expect(() => parseJwtExpiryMs("header.eyJzdWIiOiJ0ZXN0In0.signature")).toThrow("缺少有效 exp");
 });

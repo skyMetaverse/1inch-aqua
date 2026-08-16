@@ -59,10 +59,15 @@ export class ExpiringBearerTokenCache {
     });
     return this.refreshPromise;
   }
+
+  /** 401/403 表示服务端不接受当前 token；立即移除而不是等待本地 exp，下一次 get 会单次刷新。 */
+  invalidate(): void {
+    this.cached = undefined;
+  }
 }
 
 let transportPromise: Promise<Transport> | null = null;
-function getTransport(): Promise<Transport> {
+export function getOneInchTransport(): Promise<Transport> {
   transportPromise ??= createTransport({ browser: BROWSER, poolMaxIdlePerHost: 8 });
   return transportPromise;
 }
@@ -74,7 +79,7 @@ async function requestAuthToken(): Promise<string> {
     let response: Awaited<ReturnType<typeof fetch>>;
     try {
       response = await fetch(`${BASE_URL}/auth/token`, {
-        transport: await getTransport(),
+        transport: await getOneInchTransport(),
         headers: {
           accept: "application/json, text/plain, */*",
           referer: "https://1inch.com/",
@@ -103,4 +108,15 @@ const sharedTokenCache = new ExpiringBearerTokenCache(requestAuthToken);
 /** Aqua 策略、Pair 与 EMSH current 共用同一进程内 Bearer token。 */
 export function getOneInchAuthToken(): Promise<string> {
   return sharedTokenCache.get();
+}
+
+/**
+ * 在同一共享 transport 上执行带认证请求。仅当服务端明确 401/403 时失效 JWT 并重试一次，避免将业务错误或限流错误误作认证刷新。
+ */
+export async function requestWithOneInchAuth<T extends { status: number }>(request: (token: string) => Promise<T>): Promise<T> {
+  let response = await request(await sharedTokenCache.get());
+  if (response.status !== 401 && response.status !== 403) return response;
+  sharedTokenCache.invalidate();
+  response = await request(await sharedTokenCache.get());
+  return response;
 }

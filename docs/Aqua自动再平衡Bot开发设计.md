@@ -40,7 +40,7 @@ GET https://proxy-app.1inch.com/v2.0/aqua/v1.0/strategies/makers/{maker}
   &chainId={chainId}
 ```
 
-请求需先调用 `GET /v2.0/auth/token` 获取 Bearer JWT，并使用 1inch 网页端一致的 `referer`、`user-agent` 和 `accept-language` 请求头。运行时解析 JWT `exp`，由策略、Pair 与 EMSH 请求共享进程内 token，到期前 60 秒才刷新；并发请求合并为一次认证调用，不按 30 秒轮询重复请求。
+请求需先调用 `GET /v2.0/auth/token` 获取 Bearer JWT，并使用 1inch 网页端一致的 `referer`、`user-agent` 和 `accept-language` 请求头。运行时解析 JWT `exp`，由策略、Pair 与 EMSH 请求共享同一进程内 token 和 `wreq-js` 浏览器 transport，到期前 60 秒才刷新；并发请求合并为一次认证调用，不按 30 秒轮询重复请求。服务端明确返回 `401/403` 时仅失效缓存、刷新一次并重试同一个只读请求。
 
 已实际观测的响应包含：
 

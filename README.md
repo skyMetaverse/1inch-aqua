@@ -116,7 +116,7 @@ bun run check-lp-prices --maker 0x01162202AC4A4C686FE95B946E4833b8869CF961 confi
 
 ## 自动再平衡 Bot
 
-Bot 查询 1inch 官方策略 API `status=open` 返回的当前 maker 仓位，并自动处理受支持的 `classification.type=concentrated` 策略。1inch 的 `auth/token` JWT 只在进程启动时获取，Aqua 策略、Pair 与 EMSH current 共用内存缓存，并在 JWT `exp` 到期前 60 秒刷新；不会每 30 秒轮询或每个 current 请求一次。`classification.state=active` 沿用连续越界、冷却期、Pair 最少 swaps 与 Pair/EMSH 价格交叉校验后重挂；`classification.state=illiquidity` 是强制重挂触发，会读取 EMSH current 构造新区间后直接执行受完整链上复核保护的 `dock -> ship`，不等待上述市场或冷却门槛。策略 API 的 `currentBalance` 用于 dock 前核对旧策略，EMSH current 用于计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足对应状态规则时直接广播交易。
+Bot 查询 1inch 官方策略 API `status=open` 返回的当前 maker 仓位，并自动处理受支持的 `classification.type=concentrated` 策略。1inch 的 `auth/token` JWT 与 `wreq-js` 浏览器会话只在进程启动时建立，Aqua 策略、Pair 与 EMSH current 共用同一内存 token/transport，并在 JWT `exp` 到期前 60 秒刷新；不会每 30 秒轮询或每个 current 请求一次。若服务端明确返回 `401/403`，Bot 仅失效 token、刷新一次并重试同一个只读 API 请求。`classification.state=active` 沿用连续越界、冷却期、Pair 最少 swaps 与 Pair/EMSH 价格交叉校验后重挂；`classification.state=illiquidity` 是强制重挂触发，会读取 EMSH current 构造新区间后直接执行受完整链上复核保护的 `dock -> ship`，不等待上述市场或冷却门槛。策略 API 的 `currentBalance` 用于 dock 前核对旧策略，EMSH current 用于计算新的 5 bp 区间。Pair API 的 `volumeUsd` 仅记录为观察数据。它不提供 `--dry-run`：解密私钥后会持续运行，并在满足对应状态规则时直接广播交易。
 
 先创建本地运行配置：
 

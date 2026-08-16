@@ -3,11 +3,10 @@
  * 核心功能：按 1inch Aqua 页面请求方式获取 current，并从原始 JSON 文本提取 price 数字字面量，避免 JSON Number 提前损失精度。
  * 主要流程：获取 Bearer token -> 使用 wreq-js 请求 current -> 校验响应 -> 返回精确价格文本、接口时间戳和请求耗时。
  */
-import { createTransport, fetch, type Transport } from "wreq-js";
-import { getOneInchAuthToken } from "./oneinch-auth.ts";
+import { fetch } from "wreq-js";
+import { getOneInchTransport, requestWithOneInchAuth } from "./oneinch-auth.ts";
 
 const BASE_URL = "https://proxy-app.1inch.com/v2.0";
-const BROWSER = "chrome_149";
 const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
 export interface CurrentPrice {
@@ -15,13 +14,6 @@ export interface CurrentPrice {
   timestamp: number;
   elapsedMs: number;
   rawResponse: string;
-}
-
-let transportPromise: Promise<Transport> | null = null;
-
-function getTransport(): Promise<Transport> {
-  transportPromise ??= createTransport({ browser: BROWSER, poolMaxIdlePerHost: 8 });
-  return transportPromise;
 }
 
 function headers(token?: string): Record<string, string> {
@@ -55,11 +47,10 @@ export function extractCurrentPrice(rawResponse: string): { priceText: string; t
  */
 export async function getCurrentPrice(token0: string, token1: string, chainId: number): Promise<CurrentPrice> {
   const start = Date.now();
-  const token = await getOneInchAuthToken();
-  const response = await fetch(
+  const response = await requestWithOneInchAuth(async (token) => fetch(
     `${BASE_URL}/charts/v1.0/chart/tradingview/${token0}/${token1}/86400/${chainId}/current`,
-    { transport: await getTransport(), headers: headers(token), method: "GET" },
-  );
+    { transport: await getOneInchTransport(), headers: headers(token), method: "GET" },
+  ));
   const rawResponse = await response.text();
   if (response.status !== 200) throw new Error(`EMSH current 接口失败：HTTP ${response.status}`);
   const extracted = extractCurrentPrice(rawResponse);

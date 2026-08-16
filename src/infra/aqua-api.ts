@@ -3,15 +3,13 @@
  * 核心功能：获取认证 token、完整读取 maker active 策略、批量读取 Pair 市场信息，并严格校验外部响应。
  * 主要流程：复用浏览器指纹 transport -> 获取短期 Bearer token -> 请求 API -> 规范化为 Bot 快照。
  */
-import { createTransport, fetch, type Transport } from "wreq-js";
-import { getOneInchAuthToken } from "./oneinch-auth.ts";
+import { fetch } from "wreq-js";
+import { getOneInchTransport, requestWithOneInchAuth } from "./oneinch-auth.ts";
 import { isAddress, type Address, type Hex } from "viem";
 
 const BASE_URL = "https://proxy-app.1inch.com/v2.0";
-const BROWSER = "chrome_149";
 const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 const PAGE_SIZE = 100;
-let transportPromise: Promise<Transport> | null = null;
 
 export interface ApiTokenBalance { raw: bigint; usd: number; }
 export interface ApiStrategyToken { address: Address; symbol: string; decimals: number; initialBalance: ApiTokenBalance; currentBalance: ApiTokenBalance; }
@@ -19,7 +17,6 @@ export interface ApiStrategy { chainId: number; maker: Address; app: Address; st
 export interface PairMarket { token0: Address; token1: Address; lastPrice: number; volumeUsd: number; swaps: number; diffPercent1h: number; diffPercent24h: number; diffPercent7d: number; }
 
 function headers(token?: string): Record<string, string> { return { accept: "application/json, text/plain, */*", referer: "https://1inch.com/", "user-agent": USER_AGENT, "accept-language": "en-US,en;q=0.9,zh-CN;q=0.8", ...(token ? { authorization: `Bearer ${token}` } : {}) }; }
-function getTransport(): Promise<Transport> { transportPromise ??= createTransport({ browser: BROWSER, poolMaxIdlePerHost: 8 }); return transportPromise; }
 function record(value: unknown, field: string): Record<string, unknown> { if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${field} 必须是对象`); return value as Record<string, unknown>; }
 function address(value: unknown, field: string): Address { if (typeof value !== "string" || !isAddress(value)) throw new Error(`${field} 不是有效 EVM 地址`); return value; }
 function hex(value: unknown, field: string): Hex { if (typeof value !== "string" || !/^0x(?:[0-9a-fA-F]{2})+$/.test(value)) throw new Error(`${field} 不是非空十六进制字符串`); return value as Hex; }
@@ -58,8 +55,8 @@ export function parsePairMarket(value: unknown): PairMarket {
 
 /** 获取 maker 全部 open 策略；未知 cursor 语义时拒绝继续，绝不漏监控后自动交易。 */
 export async function getActiveStrategies(maker: Address, chainId: number): Promise<ApiStrategy[]> {
-  const token = await getOneInchAuthToken(); const query = new URLSearchParams({ status: "open", limit: String(PAGE_SIZE), chainId: String(chainId) });
-  const response = await fetch(`${BASE_URL}/aqua/v1.0/strategies/makers/${maker}?${query}`, { transport: await getTransport(), headers: headers(token), method: "GET" });
+  const query = new URLSearchParams({ status: "open", limit: String(PAGE_SIZE), chainId: String(chainId) });
+  const response = await requestWithOneInchAuth(async (token) => fetch(`${BASE_URL}/aqua/v1.0/strategies/makers/${maker}?${query}`, { transport: await getOneInchTransport(), headers: headers(token), method: "GET" }));
   if (response.status !== 200) throw new Error(`查询活跃 LP 仓位失败：HTTP ${response.status}`);
   const data = record(await response.json(), "策略响应"); if (!Array.isArray(data.items)) throw new Error("策略响应缺少 items 数组");
   if (data.nextCursor !== null && data.nextCursor !== undefined) throw new Error("策略 API 返回 nextCursor，当前版本未验证分页参数，已停止自动交易");
@@ -70,7 +67,7 @@ export async function getActiveStrategies(maker: Address, chainId: number): Prom
 /** 批量查询 Pair 市场数据；响应必须与请求 pair 一一对应，防止错配市场阈值。 */
 export async function getPairMarkets(chainId: number, pairs: Array<[Address, Address]>): Promise<PairMarket[]> {
   if (pairs.length === 0) return [];
-  const token = await getOneInchAuthToken(); const response = await fetch(`${BASE_URL}/bff/v1.0/tokens-market/${chainId}/pair`, { transport: await getTransport(), headers: { ...headers(token), "content-type": "application/json" }, method: "POST", body: JSON.stringify({ pairs }) });
+  const response = await requestWithOneInchAuth(async (token) => fetch(`${BASE_URL}/bff/v1.0/tokens-market/${chainId}/pair`, { transport: await getOneInchTransport(), headers: { ...headers(token), "content-type": "application/json" }, method: "POST", body: JSON.stringify({ pairs }) }));
   if (response.status !== 200 && response.status !== 201) throw new Error(`查询 Pair 市场失败：HTTP ${response.status}`);
   const data = await response.json(); if (!Array.isArray(data) || data.length !== pairs.length) throw new Error("Pair 市场响应数量与请求不一致");
   const result = data.map(parsePairMarket);
