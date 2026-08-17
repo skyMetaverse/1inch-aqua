@@ -135,6 +135,33 @@ test("raw 广播超时返回本地可验证交易哈希", async () => {
   expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
 });
 
+/** pending nonce 短暂滞后时，前一笔超时但被节点接收的 raw 必须保留后续 nonce，不能让下一独立交易重签同一 nonce。 */
+test("raw 广播结果不确定后本地 nonce 游标覆盖滞后的 pending 查询", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  let rawRequestCount = 0;
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0x379";
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_maxPriorityFeePerGas") return "0x3b9aca00";
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" } as unknown as Hex;
+      if (args.method === "eth_sendRawTransaction") {
+        rawRequestCount += 1;
+        if (rawRequestCount === 1) throw new Error("The request timed out.");
+        return "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+      }
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  const transaction = { to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a" as const, data: "0x28defc17" as Hex, value: 0n };
+  await expect(sendLocallySignedTransaction(testAccount, testChain, transport, transaction, {})).rejects.toBeInstanceOf(RawBroadcastIndeterminateError);
+  await sendLocallySignedTransaction(testAccount, testChain, transport, transaction, {});
+  const rawTransactions = requests.filter((request) => request.method === "eth_sendRawTransaction").map((request) => parseTransaction(request.params?.[0] as Hex));
+  expect(rawTransactions.map((item) => item.nonce)).toEqual([889, 890]);
+  expect(rawRequestCount).toBe(2);
+});
+
 test("RPC 返回零 priority fee 时以 1 wei 广播，兼容要求最小 tip 的节点", async () => {
   const requests: Array<{ method: string; params?: unknown[] }> = [];
   const transport = custom({

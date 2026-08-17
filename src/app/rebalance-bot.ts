@@ -70,6 +70,11 @@ export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | 
 }
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 
+/** 仅 nonce too low 可确定当前 raw 未被节点接收；其他 BLOCKED 原因没有同等安全重试条件，必须继续人工保留。 */
+export function isRetryableNonceBlockedPlan(plan: Pick<PersistedPlan, "stage" | "blockedReason">): boolean {
+  return plan.stage === "BLOCKED" && /nonce too low/i.test(plan.blockedReason ?? "");
+}
+
 /** 以最小信号接口隔离 process，允许测试验证 Ctrl+C/服务停止会进入同一清理路径。 */
 export interface RebalanceTerminationSignalSource {
   once(event: "SIGINT" | "SIGTERM", listener: (signal: string) => void): unknown;
@@ -433,8 +438,21 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
   const marketResults = uniquePairs.length > 0 ? await getPairMarkets(parameters.config.chainId, uniquePairs) : [];
   const markets = new Map(uniquePairs.map((pair, index) => [`${pair[0].toLowerCase()}:${pair[1].toLowerCase()}`, marketResults[index]]));
   for (const strategy of supported) {
-    const key = logicalKey(strategy); const existingPlan = parameters.state.plans[key];
-    if (existingPlan && existingPlan.stage !== "ACTIVE_LATEST") { const reason = `存在未完成或已阻止计划：${existingPlan.stage}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，跳过新决策`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, existingPlan.stage === "BLOCKED" ? "BLOCK" : "PLAN", reason)); continue; }
+    const key = logicalKey(strategy); let existingPlan = parameters.state.plans[key];
+    if (existingPlan && existingPlan.stage !== "ACTIVE_LATEST") {
+      if (isRetryableNonceBlockedPlan(existingPlan)) {
+        // nonce too low 表明节点未接受该 raw；删除旧计划后重新执行 API/链上预检，不能沿用过期 calldata 或自动重发。
+        delete parameters.state.plans[key];
+        saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
+        parameters.logger.info(`检测到 nonce too low 的历史阻止计划，已删除并重新决策：逻辑仓位=${key}`);
+        existingPlan = undefined;
+      } else {
+        const reason = `存在未完成或已阻止计划：${existingPlan.stage}`;
+        parameters.logger.info(`逻辑仓位=${key} ${reason}，跳过新决策`);
+        parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, existingPlan.stage === "BLOCKED" ? "BLOCK" : "PLAN", reason));
+        continue;
+      }
+    }
     if (existingPlan?.shipStrategyHash && existingPlan.shipStrategyHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { const reason = `等待策略 API 索引新 hash=${existingPlan.shipStrategyHash}`; parameters.logger.info(`逻辑仓位=${key} ${reason}，当前仍返回=${strategy.strategyHash}`); parameters.terminal?.upsert(dashboardPlaceholderRow(strategy, "PLAN", reason)); continue; }
     const recalculatedHash = AquaProtocolContract.calculateStrategyHash(new HexString(strategy.strategyBytes)).toString();
     if (recalculatedHash.toLowerCase() !== strategy.strategyHash.toLowerCase()) { parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：strategyBytes hash 校验失败，实际=${recalculatedHash}`); continue; }
@@ -520,6 +538,13 @@ async function main(): Promise<void> {
           delete state.plans[plan.logicalPositionKey];
           saveRebalanceState(config.runtime.stateFile, state);
           logger.info(`API 快照计划已失效，下一轮重新拉取：逻辑仓位=${plan.logicalPositionKey}，原因=${message}`);
+          return;
+        }
+        if (/nonce too low/i.test(message)) {
+          // 节点明确拒绝旧 nonce 代表当前 raw 未被接收；放弃该未发送计划，下一轮重新读取 API 和 pending nonce，不能自动重发原交易。
+          delete state.plans[plan.logicalPositionKey];
+          saveRebalanceState(config.runtime.stateFile, state);
+          logger.info(`nonce 已被占用，已放弃未发送计划并在下一轮重新决策：逻辑仓位=${plan.logicalPositionKey}，原因=${message}`);
           return;
         }
         const latest = state.plans[plan.logicalPositionKey] ?? plan;

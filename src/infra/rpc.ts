@@ -42,6 +42,25 @@ const GWEI_IN_WEI = 1_000_000_000n;
 const MAX_FEE_PER_GAS_FIELD = "MAX_FEE_PER_GAS_GWEI";
 const MAX_PRIORITY_FEE_PER_GAS_FIELD = "MAX_PRIORITY_FEE_PER_GAS_GWEI";
 
+/** 同一进程的连续本地签名交易游标。RPC pending nonce 短暂滞后时，已接受或结果不确定的 raw 也必须保留后续 nonce。 */
+const nextNonceByAccount = new Map<string, number>();
+
+function nonceCacheKey(chainId: number, account: Address): string {
+  return `${chainId}:${account.toLowerCase()}`;
+}
+
+function reserveNextNonce(key: string, usedNonce: number): void {
+  const nextNonce = usedNonce + 1;
+  nextNonceByAccount.set(key, Math.max(nextNonceByAccount.get(key) ?? 0, nextNonce));
+}
+
+function recordNodeNextNonce(key: string, error: unknown): void {
+  const match = firstErrorLine(error).match(/next nonce\s+(\d+)/i);
+  if (!match?.[1]) return;
+  const nextNonce = Number(match[1]);
+  if (Number.isSafeInteger(nextNonce) && nextNonce >= 0) nextNonceByAccount.set(key, Math.max(nextNonceByAccount.get(key) ?? 0, nextNonce));
+}
+
 /** 将最多九位小数的 gwei 文本精确转换为 wei，禁止浮点数导致费率精度漂移。 */
 function parseGweiToWei(value: string, field: string): bigint {
   if (!/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/.test(value)) throw new Error(`.env 中 ${field} 必须是最多 9 位小数的非负 gwei 十进制数`);
@@ -204,9 +223,12 @@ export async function sendLocallySignedTransaction(
   feeOverrides: Eip1559FeeOverrides = readEip1559FeeOverrides(),
 ): Promise<Hex> {
   const publicClient = createPublicClient({ chain, transport });
+  const accountNonceKey = nonceCacheKey(chain.id, account.address);
   let nonce: number;
   try {
-    nonce = transaction.nonce ?? await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+    const rpcNonce = transaction.nonce ?? await publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+    // 优先使用节点已知的更高 nonce；节点查询短暂滞后时，保留本进程刚广播或等待回执交易的后续 nonce。
+    nonce = transaction.nonce ?? Math.max(rpcNonce, nextNonceByAccount.get(accountNonceKey) ?? 0);
   } catch (error) {
     throw new Error(`读取 pending nonce 失败：${firstErrorLine(error)}`);
   }
@@ -230,13 +252,19 @@ export async function sendLocallySignedTransaction(
 
   try {
     // raw 广播一旦得到网络级错误，节点接收状态不可假设；禁止自动重试，交由调用方只读确认后决定下一次操作。
-    return await publicClient.request({ method: "eth_sendRawTransaction", params: [serialized] }, { retryCount: 0 });
+    const hash = await publicClient.request({ method: "eth_sendRawTransaction", params: [serialized] }, { retryCount: 0 });
+    reserveNextNonce(accountNonceKey, nonce);
+    return hash;
   } catch (error) {
     const reason = firstErrorLine(error);
     if (isIndeterminateBroadcastError(error)) {
       // 已签名 raw 的 keccak256 是节点应返回的交易 hash；只提供查询锚点，不代表可安全重发。
+      // 调用方会等待同一 hash 的回执，因此先保留 nonce + 1，防止查询节点短暂返回旧 pending nonce。
+      reserveNextNonce(accountNonceKey, nonce);
       throw new RawBroadcastIndeterminateError(keccak256(serialized), reason);
     }
+    // 节点明确拒绝 nonce too low 时这笔 raw 未被接受；记录节点给出的下一个 nonce，仅供下一次独立计划使用，绝不自动重发当前 raw。
+    recordNodeNextNonce(accountNonceKey, error);
     throw new Error(`raw 广播失败：nonce=${nonce}，gas=${gas}，maxFeePerGas=${fees.maxFeePerGas ?? "unknown"}，maxPriorityFeePerGas=${fees.maxPriorityFeePerGas ?? "unknown"}，原因=${reason}`);
   }
 }

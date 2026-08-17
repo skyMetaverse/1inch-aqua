@@ -4,7 +4,7 @@
  * 主要流程：构造确定性余额和 1e18 价格区间 -> 调用纯函数 -> 断言唯一动作。
  */
 import { expect, test } from "bun:test";
-import { buildLogicalPositionKey, deriveWalletShipAmounts, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
+import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableNonceBlockedPlan, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
 import { decideRebalance, isNearEqualUsd, outsideDistancePercent } from "../src/domain/rebalance.ts";
 import { FIXED_SCALE, parsePercentage } from "../src/domain/fixed.ts";
 
@@ -29,6 +29,13 @@ test("按目标模式从实际钱包余额导出全额 ship 金额", () => {
   expect(deriveWalletShipAmounts(wallet, "two-sided")).toEqual([123n, 456n]);
   expect(() => deriveWalletShipAmounts([0n, 456n], "upper")).toThrow("token0 余额为零");
   expect(() => deriveWalletShipAmounts([123n, 0n], "two-sided")).toThrow("两侧余额必须均大于零");
+});
+
+/** 只有节点明确拒绝旧 nonce 的历史计划可安全重新决策；链上执行或资金类失败仍必须保留 BLOCKED。 */
+test("仅 nonce too low 的 BLOCKED 计划允许重新决策", () => {
+  expect(isRetryableNonceBlockedPlan({ stage: "BLOCKED", blockedReason: "raw 广播失败：nonce too low: next nonce 890" })).toBe(true);
+  expect(isRetryableNonceBlockedPlan({ stage: "BLOCKED", blockedReason: "ship 回执失败" })).toBe(false);
+  expect(isRetryableNonceBlockedPlan({ stage: "DOCK_SENT", blockedReason: "nonce too low" })).toBe(false);
 });
 
 test("同一 pair 的不同 strategyHash 使用独立逻辑仓位 key", () => {

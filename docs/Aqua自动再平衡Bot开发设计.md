@@ -316,7 +316,7 @@ current 两侧均为 0：阻止自动处理
 
 ## 7. 自动执行状态机与恢复
 
-Bot 每次只处理一个逻辑仓位，所有 wallet 交易严格串行，避免 nonce 竞争。
+Bot 每次只处理一个逻辑仓位，所有 wallet 交易严格串行。进程内按 `{chainId, maker}` 保存已接受或等待回执的下一 nonce；新交易使用 `max(RPC pending nonce, 本地游标)`，避免 RPC 查询短暂滞后时重签已占用 nonce。
 
 ```text
 DISCOVERED
@@ -395,7 +395,7 @@ shipTransactionHash?
 1. 校验 API strategy hash、strategy bytes、maker、chain、app 和 token 列表。
 2. 链上读取全部 rawBalances，并要求与 API 计划 raw 金额完全一致。
 3. 构建并 `eth_call` 模拟 dock。
-4. 使用 `PrivateKeyAccount` 本地签名；广播前显式读取 pending nonce、估算 gas 和最新区块 EIP-1559 `baseFeePerGas`，通过 `eth_sendRawTransaction` 广播，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 .env 同时设置 `MAX_FEE_PER_GAS_GWEI` 与 `MAX_PRIORITY_FEE_PER_GAS_GWEI`，则采用该对上限，并在 `maxFee < baseFee + priority` 时本地拒绝广播。
+4. 使用 `PrivateKeyAccount` 本地签名；广播前显式读取 pending nonce、估算 gas 和最新区块 EIP-1559 `baseFeePerGas`，并以进程内 nonce 游标抵御查询滞后，通过 `eth_sendRawTransaction` 广播，不调用部分 RPC 不兼容的隐式 `eth_fillTransaction`。若 .env 同时设置 `MAX_FEE_PER_GAS_GWEI` 与 `MAX_PRIORITY_FEE_PER_GAS_GWEI`，则采用该对上限，并在 `maxFee < baseFee + priority` 时本地拒绝广播。
 5. 等待至少一个确认。
 6. 校验目标 `Docked` 事件。
 7. 回读全部 rawBalances，确认余额为零且 tokensCount 为 docked 哨兵。
@@ -409,7 +409,7 @@ shipTransactionHash?
 5. 先 `eth_call` 模拟 ship，再本地签名广播。
 6. 校验 receipt、`Shipped`，每个非零 token 的 `Pushed`，以及新 hash 的 rawBalances。
 
-错误、网络超时、限流、返回字段漂移、模拟回滚或回执失败必须停止当前逻辑仓位的自动交易。不得继续处理同一计划的下一阶段，也不得基于猜测重试不同交易参数。
+错误、网络超时、限流、返回字段漂移、模拟回滚或回执失败必须停止当前逻辑仓位的自动交易。不得继续处理同一计划的下一阶段，也不得基于猜测重试不同交易参数。唯一例外是节点明确拒绝 `nonce too low`：当前 raw 未被接收，Bot 删除该未发送计划，下一轮重新拉取 API、重新预检并决策；绝不重发旧 raw。
 
 ## 9. 日志要求
 
