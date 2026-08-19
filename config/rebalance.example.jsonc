@@ -13,9 +13,9 @@
   },
   "rebalance": {
     "fee": "0.001%",
-    // 单边总宽度 5 bp；双边上下各 5 bp。
-    "singleSidedWidth": "0.05%",
-    "twoSidedHalfWidth": "0.05%",
+    // 单边总宽度 15 bp；双边上下各 15 bp。
+    "singleSidedWidth": "0.15%",
+    "twoSidedHalfWidth": "0.15%",
     "recenterExcess": "0.03%",
     "cooldownSeconds": 900,
     // 单边部分成交后，小侧 USD 达到大侧的 80% 即转双边。

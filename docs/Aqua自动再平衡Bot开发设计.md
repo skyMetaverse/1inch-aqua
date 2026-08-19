@@ -101,7 +101,7 @@ Pair API 用于判断交易对近期是否存在自然市场活动，不能作�
 GET https://proxy-app.1inch.com/v2.0/charts/v1.0/chart/tradingview/{token0}/{token1}/86400/{chainId}/current
 ```
 
-现有 `src/infra/emsh.ts` 已实现：从原始 JSON 文本抽取 `price` 数字字面量，拒绝科学计数法，并返回接口时间戳。价格超过 Aqua 的 18 位定点精度时，由价格源边界使用 bigint 向下量化并记录精度损失；它是第一版计算新策略 5 bp 区间的唯一价格输入。
+现有 `src/infra/emsh.ts` 已实现：从原始 JSON 文本抽取 `price` 数字字面量，拒绝科学计数法，并返回接口时间戳。价格超过 Aqua 的 18 位定点精度时，由价格源边界使用 bigint 向下量化并记录精度损失；它是第一版计算新策略 15 bp 区间的唯一价格输入。
 
 EMSH current 仅用于市场价格与区间计算；不读取钱包仓位、不决定单边转双边。
 
@@ -169,8 +169,8 @@ API 分页无法确认完整
 轮询间隔：30 秒
 连续越界确认：3 次轮询
 最短重挂冷却：900 秒（15 分钟）
-单边区间宽度：5 bp（0.05%）
-双边区间半宽：5 bp（上下各 0.05%，总宽 10 bp）
+单边区间宽度：15 bp（0.15%）
+双边区间半宽：15 bp（上下各 0.15%，总宽 30 bp）
 越界额外缓冲：3 bp（0.03%）
 单边转双边阈值：较小侧 USD >= 较大侧 USD 的 80%
 ```
@@ -178,9 +178,9 @@ API 分页无法确认完整
 含义：
 
 ```text
-lower 单边： [current × (1 - 0.05%), current]
-upper 单边： [current, current × (1 + 0.05%)]
-双边：       [current × (1 - 0.05%), current × (1 + 0.05%)]
+lower 单边： [current × (1 - 0.15%), current]
+upper 单边： [current, current × (1 + 0.15%)]
+双边：       [current × (1 - 0.15%), current × (1 + 0.15%)]
 ```
 
 “越界额外缓冲 3 bp”表示不在刚越过边界时立即交易。只有价格在区间外，且相对最近边界额外偏离至少 3 bp，并连续满足 3 次轮询和 15 分钟冷却期，才计划自动重挂。这样避免在边界噪声附近反复 `dock + ship`。
@@ -216,8 +216,8 @@ config/rebalance.jsonc
 
   "rebalance": {
     "fee": "0.001%",
-    "singleSidedWidth": "0.05%",
-    "twoSidedHalfWidth": "0.05%",
+    "singleSidedWidth": "0.15%",
+    "twoSidedHalfWidth": "0.15%",
     "recenterExcess": "0.03%",
     "cooldownSeconds": 900,
     "convertToTwoSidedMinValueRatioBps": 8000
@@ -269,7 +269,7 @@ current 两侧均为 0：阻止自动处理
 关闭旧策略并确认 dock
 -> 读取目标侧实际钱包 raw 余额并全额冻结
 -> 使用 EMSH current 已计算的区间
--> 以同方向创建新的 5 bp 单边策略
+-> 以同方向创建新的 15 bp 单边策略
 ```
 
 若 API 显示单边策略已发生部分成交、两侧 raw 均大于零：
@@ -278,11 +278,11 @@ current 两侧均为 0：阻止自动处理
 小侧 USD / 大侧 USD >= 80%：
   关闭旧策略并确认 dock
   -> 使用两侧实际钱包余额并全额冻结
-  -> 使用 EMSH current 创建上下各 5 bp 的双边策略
+  -> 使用 EMSH current 创建上下各 15 bp 的双边策略
 
 小侧 USD / 大侧 USD < 80%：
   关闭旧策略
-  -> 以 USD 较大的一侧 raw 余额创建对应方向的 5 bp 单边策略
+  -> 以 USD 较大的一侧 raw 余额创建对应方向的 15 bp 单边策略
   -> 较小侧资产保留在钱包，不进行外部 swap、不并入新策略
 ```
 
@@ -297,7 +297,7 @@ current 两侧均为 0：阻止自动处理
 ```text
 关闭旧策略并确认 dock
 -> 严格使用两侧实际钱包余额并全额冻结
--> 使用 EMSH current 创建上下各 5 bp 的双边策略
+-> 使用 EMSH current 创建上下各 15 bp 的双边策略
 ```
 
 若一侧 raw 为零，按 6.1 自动降级为对应单边逻辑。
@@ -486,7 +486,7 @@ test/
 2. API 策略响应中的地址、hash、token 数、raw、usd、分类和分页异常。
 3. 单边 upper/lower、双边、零余额和部分成交余额分类。
 4. 小侧 USD 恰好 80%、略低于 80%、USD 为零或无效时的转双边判定。
-5. 5 bp 单边和双边精确区间、3 bp 越界缓冲、连续三次确认和 15 分钟冷却。
+5. 15 bp 单边和双边精确区间、3 bp 越界缓冲、连续三次确认和 15 分钟冷却。
 6. Pair/EMSH 价格偏离、低 volume、低 swaps、过期 current 阻止执行。
 7. 每逻辑仓位仅保留最新计划；新快照替换旧计划。
 8. 状态文件原子写入、损坏状态拒绝启动、`DOCK_VERIFIED` 后恢复优先级。
