@@ -24,7 +24,7 @@ import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { RebalanceTerminalDashboard, type DashboardStatus, type RebalanceDashboardRow } from "../infra/rebalance-terminal.ts";
 import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
 import { acquireRebalanceLock, loadRebalanceState, saveRebalanceState, type PersistedPlan, type StateDocument } from "../infra/rebalance-state.ts";
-import { addConfiguredPosition, ensureMaximumAllowance } from "./add-lp.ts";
+import { addConfiguredPositions, ensureMaximumAllowance } from "./add-lp.ts";
 
 const DEFAULT_CONFIG_PATH = "config/rebalance.jsonc";
 const ENV_FILE = ".env";
@@ -476,16 +476,20 @@ async function executeShip(parameters: { plan: PersistedPlan; state: StateDocume
 
 /**
  * 补足配置中缺失的 LP。该路径仅使用配置模板初始创建新仓位；已经存在的策略不会被此函数重置模式或资金比例。
- * 单个模板完整成功后立即持久化 hash，失败则保留空槽位供下一轮重试，避免批量交易中部分成功后失去关联。
+ * 两个及以上缺口必须在同一笔 multicall 中创建，所有 receipt 与 rawBalances 复核通过后才一次写入槽位关联，避免部分创建。
  */
 async function replenishConfiguredPositions(parameters: { missing: readonly PositionConfig[]; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; account: PrivateKeyAccount; chain: Chain; registry: Address; rpcUrl: string; logger: Logger }): Promise<void> {
+  if (parameters.missing.length === 0) return;
   for (const position of parameters.missing) {
     parameters.logger.info(`检测到配置 LP 缺口：配置槽位=${position.id}，按 lp.add 模板创建初始仓位`);
-    const strategyHash = await addConfiguredPosition({ position, index: 0, publicClient: parameters.client, account: parameters.account, chain: parameters.chain, chainId: parameters.config.chainId, registry: parameters.registry, rpcUrl: parameters.rpcUrl, logger: parameters.logger });
-    parameters.state.configuredSlots[position.id] = { strategyHash, updatedAt: Date.now() };
-    saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
-    parameters.logger.info(`配置 LP 缺口已补足：配置槽位=${position.id}，strategyHash=${strategyHash}`);
   }
+  const created = await addConfiguredPositions({ positions: parameters.missing, publicClient: parameters.client, account: parameters.account, chain: parameters.chain, chainId: parameters.config.chainId, registry: parameters.registry, rpcUrl: parameters.rpcUrl, logger: parameters.logger });
+  const updatedAt = Date.now();
+  for (const { positionId, strategyHash } of created) {
+    parameters.state.configuredSlots[positionId] = { strategyHash, updatedAt };
+    parameters.logger.info(`配置 LP 缺口已补足：配置槽位=${positionId}，strategyHash=${strategyHash}`);
+  }
+  saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
 }
 
 /**

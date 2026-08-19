@@ -39,11 +39,48 @@ const ENV_FILE = ".env";
 const RPC_URL_FIELD = "RPC_URL";
 const MAX_CURRENT_PRICE_AGE_SECONDS = 120;
 
-interface PreparedShip {
+export interface PreparedShip {
   index: number;
   built: ReturnType<typeof buildConcentratedStrategy>;
   tokens: [Address, Address];
   amounts: [bigint, bigint];
+}
+
+/** 已确认创建的配置槽位与策略 hash 对，供 Bot 在同一批 ship 完整复核后原子更新本地关联。 */
+export interface ConfiguredPositionShip {
+  positionId: string;
+  strategyHash: Hex;
+}
+
+/**
+ * 统一编排配置模板的单笔或批量 ship。两个及以上模板必须先全部准备并模拟，再只广播一个 multicall。
+ * 该边界把“批量阈值”从命令入口和 Bot 入口收敛到同一处，防止缺口补建退化为多笔独立交易。
+ */
+export async function prepareConfiguredPositionShips(parameters: {
+  positions: readonly PositionConfig[];
+  prepare: (position: PositionConfig, index: number, batchShip: boolean) => Promise<PreparedShip | Hex | undefined>;
+  broadcast: (ships: readonly PreparedShip[]) => Promise<void>;
+}): Promise<ConfiguredPositionShip[]> {
+  const batchShip = shouldUseAquaMulticall(parameters.positions.length);
+  const preparedShips: PreparedShip[] = [];
+  const singleShips: ConfiguredPositionShip[] = [];
+  for (const [index, position] of parameters.positions.entries()) {
+    const prepared = await parameters.prepare(position, index, batchShip);
+    if (batchShip) {
+      if (!prepared || typeof prepared === "string") throw new Error(`配置仓位=${position.id} 未准备可批量广播的 ship`);
+      preparedShips.push(prepared);
+      continue;
+    }
+    if (typeof prepared !== "string") throw new Error(`配置仓位=${position.id} 未获得可验证的 ship strategyHash`);
+    singleShips.push({ positionId: position.id, strategyHash: prepared });
+  }
+  if (!batchShip) return singleShips;
+  await parameters.broadcast(preparedShips);
+  return preparedShips.map((ship) => {
+    const position = parameters.positions[ship.index];
+    if (!position) throw new Error(`批量 ship 返回了未知配置索引=${ship.index}`);
+    return { positionId: position.id, strategyHash: ship.built.strategyHash };
+  });
 }
 
 let activeLogger: Logger | null = null;
@@ -301,9 +338,27 @@ async function addPosition(parameters: {
 }
 
 /**
- * 按单个配置模板真实创建 LP，供持续再平衡 Bot 补足缺失仓位复用。
- * 复用同一套余额读取、最大授权、链上模拟、本地签名、receipt 与 rawBalances 复核，避免补仓路径弱化安全校验。
+ * 按配置模板真实创建缺失 LP，供持续再平衡 Bot 复用。
+ * 两个及以上缺口会共享完整的“余额/授权/单笔模拟 -> atomic multicall -> receipt/rawBalances 复核”流程，避免出现部分 ship。
  */
+export async function addConfiguredPositions(parameters: {
+  positions: readonly PositionConfig[];
+  publicClient: ReturnType<typeof createPublicClient>;
+  account: ReturnType<typeof privateKeyToAccount>;
+  chain: Chain;
+  chainId: number;
+  registry: Address;
+  rpcUrl: string;
+  logger: Logger;
+}): Promise<ConfiguredPositionShip[]> {
+  return prepareConfiguredPositionShips({
+    positions: parameters.positions,
+    prepare: (position, index, batchShip) => addPosition({ ...parameters, position, index, dryRun: false, batchShip }),
+    broadcast: (ships) => broadcastPreparedShips({ ships, publicClient: parameters.publicClient, account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, registry: parameters.registry, dryRun: false, logger: parameters.logger }),
+  });
+}
+
+/** 保留单模板调用入口，供外部调用者继续获得已完整复核的单个 strategyHash。 */
 export async function addConfiguredPosition(parameters: {
   position: PositionConfig;
   index: number;
@@ -315,11 +370,9 @@ export async function addConfiguredPosition(parameters: {
   rpcUrl: string;
   logger: Logger;
 }): Promise<Hex> {
-  const result = await addPosition({ ...parameters, dryRun: false, batchShip: false });
-  if (typeof result !== "string") {
-    throw new Error(`配置仓位=${parameters.position.id} 未获得可验证的 ship strategyHash`);
-  }
-  return result;
+  const [result] = await addConfiguredPositions({ ...parameters, positions: [parameters.position] });
+  if (!result) throw new Error(`配置仓位=${parameters.position.id} 未获得可验证的 ship strategyHash`);
+  return result.strategyHash;
 }
 
 async function verifyShipReceipt(parameters: {

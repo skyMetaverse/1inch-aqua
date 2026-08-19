@@ -124,7 +124,7 @@ Bot 以 `config/lp.add.jsonc` 的 `positions[].id` 和仓位数量作为持续�
 cp config/rebalance.example.jsonc config/rebalance.jsonc
 ```
 
-`config/rebalance.jsonc` 的 `runtime.lpConfigPath` 指向 LP 配置，`runtime.slotIndexingGraceSeconds` 控制已确认 ship 等待官方 API 索引新 hash 的宽限期。少于 LP 配置数量时，Bot 会按缺失配置槽位补建；已有策略不会因模式变化被强制恢复成原始模板。
+`config/rebalance.jsonc` 的 `runtime.lpConfigPath` 指向 LP 配置，`runtime.slotIndexingGraceSeconds` 控制已确认 ship 等待官方 API 索引新 hash 的宽限期。少于 LP 配置数量时，Bot 会按缺失配置槽位补建；同一轮缺失两个及以上槽位时，所有 ship 完成单笔模拟后会通过一笔 Aqua registry `multicall([ship...])` 原子广播并逐策略复核。已有策略不会因模式变化被强制恢复成原始模板。
 
 再使用交互式终端启动：
 
