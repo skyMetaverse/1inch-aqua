@@ -4,7 +4,7 @@
  * 主要流程：构造确定性余额和 1e18 价格区间 -> 调用纯函数 -> 断言唯一动作。
  */
 import { expect, test } from "bun:test";
-import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableNonceBlockedPlan, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
+import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableBlockedPlan, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
 import { decideRebalance, isNearEqualUsd, outsideDistancePercent } from "../src/domain/rebalance.ts";
 import { FIXED_SCALE, parsePercentage } from "../src/domain/fixed.ts";
 
@@ -31,11 +31,14 @@ test("按目标模式从实际钱包余额导出全额 ship 金额", () => {
   expect(() => deriveWalletShipAmounts([123n, 0n], "two-sided")).toThrow("两侧余额必须均大于零");
 });
 
-/** 只有节点明确拒绝旧 nonce 的历史计划可安全重新决策；链上执行或资金类失败仍必须保留 BLOCKED。 */
-test("仅 nonce too low 的 BLOCKED 计划允许重新决策", () => {
-  expect(isRetryableNonceBlockedPlan({ stage: "BLOCKED", blockedReason: "raw 广播失败：nonce too low: next nonce 890" })).toBe(true);
-  expect(isRetryableNonceBlockedPlan({ stage: "BLOCKED", blockedReason: "ship 回执失败" })).toBe(false);
-  expect(isRetryableNonceBlockedPlan({ stage: "DOCK_SENT", blockedReason: "nonce too low" })).toBe(false);
+/** 只允许确认未广播的 nonce 拒绝或 dock 预检 RPC 临时错误重新决策，不能放行任何已进入交易阶段的计划。 */
+test("仅安全的 BLOCKED 计划允许重新决策", () => {
+  expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "raw 广播失败：nonce too low: next nonce 890" })).toBe(true);
+  expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "Transaction creation failed." })).toBe(true);
+  expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "Transaction creation failed.", dockTransactionHash: "0x01" })).toBe(false);
+  expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "Transaction creation failed.", targetAmountsRaw: ["1", "0"] })).toBe(false);
+  expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "ship 回执失败" })).toBe(false);
+  expect(isRetryableBlockedPlan({ stage: "DOCK_SENT", blockedReason: "nonce too low" })).toBe(false);
 });
 
 test("同一 pair 的不同 strategyHash 使用独立逻辑仓位 key", () => {

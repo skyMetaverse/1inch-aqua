@@ -70,9 +70,21 @@ export function unsupportedStrategyReason(strategy: Pick<ApiStrategy, "maker" | 
 }
 function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 
-/** 仅 nonce too low 可确定当前 raw 未被节点接收；其他 BLOCKED 原因没有同等安全重试条件，必须继续人工保留。 */
-export function isRetryableNonceBlockedPlan(plan: Pick<PersistedPlan, "stage" | "blockedReason">): boolean {
-  return plan.stage === "BLOCKED" && /nonce too low/i.test(plan.blockedReason ?? "");
+/**
+ * 判断 BLOCKED 计划是否可丢弃后重新决策。
+ * 只有节点明确拒绝旧 nonce，或 dock 模拟前返回无细节的临时 RPC 创建错误时，才能确认没有可追踪的 raw 交易。
+ * 后者必须同时没有任何交易 hash 或冻结的 ship 字段，避免把已 dock/已 ship 的不确定计划误当成安全重试。
+ */
+export function isRetryableBlockedPlan(plan: Pick<PersistedPlan, "stage" | "blockedReason" | "dockTransactionHash" | "shipTransactionHash" | "walletBalancesRaw" | "targetAmountsRaw" | "shipStrategyHash">): boolean {
+  if (plan.stage !== "BLOCKED") return false;
+  if (/nonce too low/i.test(plan.blockedReason ?? "")) return true;
+  const isPreBroadcastRpcCreationFailure = plan.blockedReason === "Transaction creation failed."
+    && !plan.dockTransactionHash
+    && !plan.shipTransactionHash
+    && !plan.walletBalancesRaw
+    && !plan.targetAmountsRaw
+    && !plan.shipStrategyHash;
+  return isPreBroadcastRpcCreationFailure;
 }
 
 /** 以最小信号接口隔离 process，允许测试验证 Ctrl+C/服务停止会进入同一清理路径。 */
@@ -440,11 +452,12 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
   for (const strategy of supported) {
     const key = logicalKey(strategy); let existingPlan = parameters.state.plans[key];
     if (existingPlan && existingPlan.stage !== "ACTIVE_LATEST") {
-      if (isRetryableNonceBlockedPlan(existingPlan)) {
-        // nonce too low 表明节点未接受该 raw；删除旧计划后重新执行 API/链上预检，不能沿用过期 calldata 或自动重发。
+      if (isRetryableBlockedPlan(existingPlan)) {
+        // 此处只删除从未产生可追踪 raw 的安全重试计划；重新决策会完整重做 API、链上余额和模拟预检，绝不复用旧 calldata。
+        const retryReason = /nonce too low/i.test(existingPlan.blockedReason ?? "") ? "nonce too low" : "RPC 预检临时创建失败";
         delete parameters.state.plans[key];
         saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
-        parameters.logger.info(`检测到 nonce too low 的历史阻止计划，已删除并重新决策：逻辑仓位=${key}`);
+        parameters.logger.info(`检测到可安全重新决策的历史阻止计划：原因=${retryReason}，已删除并重新预检：逻辑仓位=${key}`);
         existingPlan = undefined;
       } else {
         const reason = `存在未完成或已阻止计划：${existingPlan.stage}`;
