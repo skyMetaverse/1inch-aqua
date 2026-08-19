@@ -13,7 +13,7 @@ bun run add-lp config/lp.add.jsonc --dry-run
 - `positions`：本次依次创建的仓位。任一仓位失败时，停止后续仓位。
 - `pair.tokens`：恰好两个 ERC20。数组顺序定义展示价格：`[token0, token1]` 表示 `1 token0 = N token1`。不填写 `decimals`，脚本会链上查询。
 - `symbol`：日志展示文本；真实代币以 `address` 为准。
-- `balancePercent`：该 token 当前钱包余额的使用比例，必须是带 `%` 的字符串，范围 `0%` 到 `100%`。
+- `balancePercent`：以该 token 当前钱包余额为基准登记的策略虚拟额度比例，必须是带 `%` 的字符串，范围 `0%` 到 `100%`。`ship` 不转出 ERC20，真实转账只在后续成交的 `pull` 发生。
 - `fee`：页面显示的实际池子费率，例如 `"0.001%"` 创建费率为 `0.001%` 的策略。当前 SDK 最小精确粒度为 `0.0000001%`，更小的值会在广播前拒绝。
 - `range.mode`：`two-sided`、`upper`、`lower`。
 - `upperPercent`：current 向上浮动百分比。双边和上单边必须大于 `0%`。
@@ -45,7 +45,7 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行仅在现有 allowance 未覆盖本次投入时尝试 `MAX_UINT256`。确认后脚本重新读取实际 allowance，只要该额度覆盖本次投入就继续；不会假设所有 ERC20 都原样存储 `MAX_UINT256`。所有非零且不足的 allowance 会先发送并确认 `approve(0)`，随后尝试最大授权，以兼容要求清零后才能修改额度的 ERC20。授权成功后 ship 失败时，授权仍会保留；脚本不会自动撤销授权。
 
-当 `positions` 数量不少于 2 时，所有仓位完成单笔 ship 模拟并按 token 汇总余额后，会再模拟并广播一笔 Aqua registry `multicall([ship...])`。任一子调用失败时整批回滚，不会部分创建；成功后逐策略复核 `Shipped`、`Pushed` 和 `rawBalances`。approve 仍保持顺序发送，multicall raw 广播失败不会自动重发。
+当 `positions` 数量不少于 2 时，所有仓位完成单笔 ship 模拟后，会再模拟并广播一笔 Aqua registry `multicall([ship...])`。Aqua `ship` 仅为每个 `strategyHash` 登记虚拟余额，真实 ERC20 在应用后续 `pull` 时才从 maker 转出；因此同一钱包余额可被多个 AKUV 策略共享，脚本不会汇总各策略的虚拟额度并要求其不超过当前钱包余额。任一子调用失败时整批回滚，不会部分创建；成功后逐策略复核 `Shipped`、`Pushed` 和 `rawBalances`。approve 仍保持顺序发送，multicall raw 广播失败不会自动重发。
 
 ## LP 只读价格检查
 

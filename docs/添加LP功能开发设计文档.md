@@ -331,7 +331,7 @@ formatFixed(value, scale)
 14. 构建 Aqua 策略、strategy bytes、strategy hash 和 ship calldata；每次构建使用 SDK 支持的 `uint64` 加密随机 salt，避免相同参数与已关闭策略重用同一 hash。
 15. 查询两个代币对 Aqua registry 的 allowance。
 16. allowance 不是最大值时，按代币兼容规则发送最大值授权，并等待每笔授权成功回执。
-17. 当配置仓位数为 1 时逐笔发送 ship；不少于 2 时，全部仓位完成单笔 ship 模拟、授权确认和按 token 汇总余额复核后，构建并模拟、估算 gas 一笔 Aqua registry `multicall([ship...])`，再本地签名广播。multicall 任一子调用失败会整批回滚；成功后在同一 receipt 中逐策略验证事件和 `rawBalances`。
+17. 当配置仓位数为 1 时逐笔发送 ship；不少于 2 时，全部仓位完成单笔 ship 模拟和授权确认后，构建并模拟、估算 gas 一笔 Aqua registry `multicall([ship...])`，再本地签名广播。`ship` 仅登记每个 `strategyHash` 的虚拟余额，多个 AKUV 策略可共享同一 maker 钱包余额作为后续 `pull` 的流动性上限；不得将各策略的虚拟额度相加后与钱包余额比较。multicall 任一子调用失败会整批回滚；成功后在同一 receipt 中逐策略验证事件和 `rawBalances`。
 18. 输出交易哈希、区块号、策略哈希、投入数量、价格和区间。
 19. 清理敏感 Buffer，记录本次运行结果。
 
@@ -357,7 +357,7 @@ formatFixed(value, scale)
 - 当前 allowance 为零时，只需尝试最大值授权，无需额外清零交易。
 - 该策略会让允许直接更新额度的标准 ERC20 在额度不足时多消耗一笔清零交易，但统一覆盖 USDT 类限制，且不依赖 token symbol、地址白名单或内部位宽猜测。
 - 任一 approve 或 allowance 复查失败、回滚、超时，均不得发送 ship。
-- 批量模式发送 ship 前重新按 token 合计所有待投入 raw amount，并与最新钱包余额比较；合计不足时整批不广播。
+- 批量模式不汇总策略虚拟额度并与钱包余额比较：官方 Aqua `ship` 只写入 `{maker, app, strategyHash, token}` 的虚拟余额；ERC20 `transferFrom(maker, to, amount)` 只在应用调用 `pull` 时发生。每条策略仍必须在 ship 前完成其额度对应的 ERC20 allowance 覆盖检查，完整 multicall 必须通过 `eth_call` 和 gas 估算。
 - 不少于两个仓位的 ship 使用单笔 atomic multicall；完整 batch 的 `eth_call` 或 `estimateGas` 失败时整批不广播。raw 广播失败时不自动重发；成功后必须在同一 receipt 中逐策略校验 `Shipped`、`Pushed` 和余额。
 - 最大授权会允许 Aqua registry 在用户后续持有该代币时持续使用该代币额度。这是本需求明确选择的授权策略，日志和 README 必须对此风险作出清晰提示，并在后续迭代提供撤销授权脚本。
 

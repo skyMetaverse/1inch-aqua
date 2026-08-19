@@ -65,7 +65,7 @@ bun run add-lp config/lp.add.jsonc
 
 真实执行会在本次投入尚未被现有 allowance 覆盖时尝试 `MAX_UINT256` 授权；确认后以链上实际回读的 allowance 是否覆盖本次投入为准。这样可兼容内部存储小于 `uint256` 或采用无限授权哨兵值的 ERC20。若 ship 失败，已确认的授权会保留，脚本不会自动撤销。
 
-当配置中的仓位数不少于 2 个时，脚本会先完成全部仓位的余额、价格、授权和单笔 `ship` 模拟，按 token 汇总最新余额后，再模拟并广播一笔 Aqua registry `multicall([ship...])`。任一子调用失败时整批回滚，不会出现部分创建；成功后在同一 receipt 中逐策略校验 `Shipped`、`Pushed` 和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。若 raw 广播响应超时，脚本会以本地签名计算出的交易 hash 查询同一笔回执，绝不重发 raw transaction；只有回执成功后才报告添加完成。
+当配置中的仓位数不少于 2 个时，脚本会先完成全部仓位的余额、价格、授权和单笔 `ship` 模拟，再模拟并广播一笔 Aqua registry `multicall([ship...])`。Aqua `ship` 只登记每个 `strategyHash` 的虚拟余额，实际 ERC20 只会在应用后续 `pull` 时从 maker 转出；因此同一钱包余额可作为多个 AKUV 策略的共享流动性上限，脚本不会把各策略虚拟额度相加后与钱包余额比较。任一子调用失败时整批回滚，不会出现部分创建；成功后在同一 receipt 中逐策略校验 `Shipped`、`Pushed` 和 `rawBalances`。授权交易仍按顺序确认，尤其是同一 token 的 `approve(0) -> approve(MAX)` 不能并发。若 raw 广播响应超时，脚本会以本地签名计算出的交易 hash 查询同一笔回执，绝不重发 raw transaction；只有回执成功后才报告添加完成。
 
 ## 一键取消全部活跃 LP 仓位
 

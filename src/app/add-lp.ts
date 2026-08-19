@@ -30,7 +30,7 @@ import {
   percentageToAquaFeeValue,
 } from "../domain/fixed.ts";
 import { getCurrentPrice } from "../infra/emsh.ts";
-import { ERC20_ABI, buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
+import { buildMaximumApprovalSteps, hasSufficientAllowance, readTokenState } from "../infra/erc20.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
 
@@ -234,8 +234,9 @@ async function addPosition(parameters: {
   const amount0 = calculatePercentAmount(state0.balance, balancePercent0);
   const amount1 = calculatePercentAmount(state1.balance, balancePercent1);
   validateAmountsForMode(position, [amount0, amount1]);
-  logger.info(`token0=${token0} decimals=${state0.decimals}，余额 raw=${state0.balance.toString()}，余额=${formatFixed(state0.balance, state0.decimals)}，比例=${position.pair.tokens[0].balancePercent}，投入 raw=${amount0.toString()}，投入=${formatFixed(amount0, state0.decimals)}，allowance=${state0.allowance.toString()}`);
-  logger.info(`token1=${token1} decimals=${state1.decimals}，余额 raw=${state1.balance.toString()}，余额=${formatFixed(state1.balance, state1.decimals)}，比例=${position.pair.tokens[1].balancePercent}，投入 raw=${amount1.toString()}，投入=${formatFixed(amount1, state1.decimals)}，allowance=${state1.allowance.toString()}`);
+  // ship 只登记策略虚拟额度；同时记录实际钱包余额，便于审计后续 pull 是否具备资金覆盖。
+  logger.info(`token0=${token0} decimals=${state0.decimals}，钱包余额 raw=${state0.balance.toString()}，钱包余额=${formatFixed(state0.balance, state0.decimals)}，比例=${position.pair.tokens[0].balancePercent}，虚拟额度 raw=${amount0.toString()}，虚拟额度=${formatFixed(amount0, state0.decimals)}，allowance=${state0.allowance.toString()}`);
+  logger.info(`token1=${token1} decimals=${state1.decimals}，钱包余额 raw=${state1.balance.toString()}，钱包余额=${formatFixed(state1.balance, state1.decimals)}，比例=${position.pair.tokens[1].balancePercent}，虚拟额度 raw=${amount1.toString()}，虚拟额度=${formatFixed(amount1, state1.decimals)}，allowance=${state1.allowance.toString()}`);
 
   logger.info(`开始请求 EMSH current：chainId=${parameters.chainId}，价格方向=1 ${position.pair.tokens[0].symbol} = N ${position.pair.tokens[1].symbol}`);
   const currentResponse = await getCurrentPrice(token0, token1, parameters.chainId);
@@ -254,13 +255,13 @@ async function addPosition(parameters: {
   const aquaRange = convertDisplayRangeToAquaSqrtRange(token0, state0.decimals, token1, state1.decimals, displayRange);
   const token0Config = position.pair.tokens[0];
   const token1Config = position.pair.tokens[1];
-  const depositedToken = position.range.mode === "upper" ? token0Config : position.range.mode === "lower" ? token1Config : undefined;
+  const allocatedToken = position.range.mode === "upper" ? token0Config : position.range.mode === "lower" ? token1Config : undefined;
   const rangeDescription = position.range.mode === "upper"
     ? `价格位于 current 上方，current 到上沿 +${position.range.upperPercent}`
     : position.range.mode === "lower"
       ? `价格位于 current 下方，下沿到 current +${position.range.lowerPercent}`
       : `价格覆盖 current，下沿到 current +${position.range.lowerPercent}，current 到上沿 +${position.range.upperPercent}`;
-  logger.info(`仓位摘要：${position.range.mode === "upper" ? "上单边" : position.range.mode === "lower" ? "下单边" : "双边"}，${rangeDescription}，投入=${depositedToken ? `${depositedToken.symbol} ${depositedToken.balancePercent}` : `${token0Config.symbol} ${token0Config.balancePercent} + ${token1Config.symbol} ${token1Config.balancePercent}`}`);
+  logger.info(`仓位摘要：${position.range.mode === "upper" ? "上单边" : position.range.mode === "lower" ? "下单边" : "双边"}，${rangeDescription}，登记虚拟额度=${allocatedToken ? `${allocatedToken.symbol} ${allocatedToken.balancePercent}` : `${token0Config.symbol} ${token0Config.balancePercent} + ${token1Config.symbol} ${token1Config.balancePercent}`}`);
   logger.info(`配置报价区间：1 ${token0Config.symbol} = ${formatFixed(displayRange.min)} 至 ${formatFixed(displayRange.max)} ${token1Config.symbol}；current=1 ${token0Config.symbol} = ${formatFixed(displayRange.current)} ${token1Config.symbol}`);
   logger.info(`反向报价区间：1 ${token1Config.symbol} = ${formatFixed(invertFixedPrice(displayRange.max))} 至 ${formatFixed(invertFixedPrice(displayRange.min))} ${token0Config.symbol}；current=1 ${token1Config.symbol} = ${formatFixed(invertFixedPrice(displayRange.current))} ${token0Config.symbol}`);
   logger.info(`链上审计价格：Aqua 方向=tokenGt/tokenLt，displayOrderCanonical=${aquaRange.isDisplayOrderCanonical}，tokenLtDecimals=${aquaRange.isDisplayOrderCanonical ? state0.decimals : state1.decimals}，tokenGtDecimals=${aquaRange.isDisplayOrderCanonical ? state1.decimals : state0.decimals}，sqrtPriceMin=${aquaRange.sqrtPriceMin.toString()}，sqrtPriceMax=${aquaRange.sqrtPriceMax.toString()}`);
@@ -341,7 +342,7 @@ async function verifyShipReceipt(parameters: {
 
 /**
  * 原子提交已经完成模拟的 ship。
- * 发送前重新合计同一 token 的 raw 投入，避免多个仓位各自模拟成功但合计超过钱包余额；完整 multicall 模拟成功后才广播一笔交易。
+ * Aqua ship 只登记每个 strategyHash 的虚拟余额，真实 ERC20 仅在 app 后续 pull 时从 maker 转出；同一钱包余额可以作为多个 AKUV 策略共享的流动性上限，因此不能把各策略虚拟额度相加后与钱包余额比较。
  */
 async function broadcastPreparedShips(parameters: {
   ships: readonly PreparedShip[];
@@ -353,20 +354,6 @@ async function broadcastPreparedShips(parameters: {
   dryRun: boolean;
   logger: Logger;
 }): Promise<void> {
-  const totals = new Map<string, { token: Address; amount: bigint }>();
-  for (const ship of parameters.ships) {
-    for (const [index, token] of ship.tokens.entries()) {
-      const amount = ship.amounts[index] ?? 0n;
-      const key = token.toLowerCase();
-      const existing = totals.get(key);
-      totals.set(key, { token, amount: (existing?.amount ?? 0n) + amount });
-    }
-  }
-  for (const { token, amount } of totals.values()) {
-    const balance = await parameters.publicClient.readContract({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [parameters.account.address] }) as bigint;
-    if (balance < amount) throw new Error(`批量 ship 前余额不足：token=${token}，最新余额=${balance.toString()}，合计投入=${amount.toString()}`);
-    parameters.logger.info(`批量 ship 余额复核：token=${token}，最新余额=${balance.toString()}，合计投入=${amount.toString()}`);
-  }
   const multicall = buildAquaMulticallTransaction(parameters.registry, parameters.ships.map((ship) => ship.built.ship));
   await parameters.publicClient.call({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
   const estimatedGas = await parameters.publicClient.estimateGas({ account: parameters.account.address, to: multicall.to, data: multicall.data, value: multicall.value });
