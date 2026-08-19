@@ -17,8 +17,10 @@ function cleanup(): void { if (existsSync(directory)) rmSync(directory, { recurs
 test("原子保存的计划可恢复且锁阻止第二进程", () => {
   cleanup();
   try {
-    saveRebalanceState(path, { version: 3, plans: { [plan.logicalPositionKey]: plan }, observations: {} });
-    expect(loadRebalanceState(path).plans[plan.logicalPositionKey]).toEqual(plan);
+    saveRebalanceState(path, { version: 4, plans: { [plan.logicalPositionKey]: plan }, observations: {}, configuredSlots: { "initial-template": { strategyHash: "0x04", updatedAt: 1 } } });
+    const loaded = loadRebalanceState(path);
+    expect(loaded.plans[plan.logicalPositionKey]).toEqual(plan);
+    expect(loaded.configuredSlots["initial-template"]).toEqual({ strategyHash: "0x04", updatedAt: 1 });
     const release = acquireRebalanceLock(path);
     try {
       expect(() => acquireRebalanceLock(path)).toThrow("正在运行");
@@ -38,11 +40,11 @@ test("v2 dock 已确认计划升级后不再携带 API ship 金额", () => {
   writeFileSync(path, JSON.stringify({ version: 2, plans: { [plan.logicalPositionKey]: legacy }, observations: {} }), "utf8");
   const loaded = loadRebalanceState(path);
   const migrated = loaded.plans[plan.logicalPositionKey];
-  expect(loaded.version).toBe(3);
+  expect(loaded.version).toBe(4);
   expect(migrated?.targetAmountsRaw).toBeUndefined();
   expect(migrated?.salt).toBeUndefined();
   expect(migrated?.shipStrategyHash).toBeUndefined();
-  expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(3);
+  expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(4);
   cleanup();
 });
 
@@ -66,7 +68,7 @@ test("钱包资金冻结与目标金额不一致时拒绝恢复", () => {
   cleanup();
   try {
     const invalid = { ...plan, targetAmountsRaw: ["11", "20"] as [string, string] };
-    saveRebalanceState(path, { version: 3, plans: { [plan.logicalPositionKey]: invalid }, observations: {} });
+    saveRebalanceState(path, { version: 4, plans: { [plan.logicalPositionKey]: invalid }, observations: {}, configuredSlots: {} });
     expect(() => loadRebalanceState(path)).toThrow("钱包资金快照与投入额不一致");
   } finally {
     cleanup();

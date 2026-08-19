@@ -4,6 +4,8 @@
   // 本次要添加的 Aqua 集中流动性仓位。可配置多个，任一仓位失败时脚本停止后续广播。
   "positions": [
     {
+      // 稳定唯一标识。rebalance Bot 用它辨识缺失的配置模板；已创建 LP 的后续模式仍会动态变化。
+      "id": "two-sided-1inch-usdt",
       "pair": {
         // 必须恰好两个 ERC20。顺序定义可读价格：第一个代币用第二个代币计价。
         // 此例表示：1 1INCH = N USDT。不要填写 native ETH，请使用 WETH 等 ERC20 地址。

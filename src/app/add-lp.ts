@@ -220,7 +220,7 @@ async function addPosition(parameters: {
   dryRun: boolean;
   logger: Logger;
   batchShip: boolean;
-}): Promise<PreparedShip | undefined> {
+}): Promise<PreparedShip | Hex | undefined> {
   const { position, logger } = parameters;
   const token0 = requireAddress(position.pair.tokens[0].address, "tokens[0].address");
   const token1 = requireAddress(position.pair.tokens[1].address, "tokens[1].address");
@@ -297,7 +297,29 @@ async function addPosition(parameters: {
 
   const hash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: built.ship, logger: parameters.logger, action: `ship strategyHash=${built.strategyHash}` });
   await verifyShipReceipt({ ...parameters, built, tokens: [token0, token1], amounts: [amount0, amount1], hash });
-  return undefined;
+  return built.strategyHash;
+}
+
+/**
+ * 按单个配置模板真实创建 LP，供持续再平衡 Bot 补足缺失仓位复用。
+ * 复用同一套余额读取、最大授权、链上模拟、本地签名、receipt 与 rawBalances 复核，避免补仓路径弱化安全校验。
+ */
+export async function addConfiguredPosition(parameters: {
+  position: PositionConfig;
+  index: number;
+  publicClient: ReturnType<typeof createPublicClient>;
+  account: ReturnType<typeof privateKeyToAccount>;
+  chain: Chain;
+  chainId: number;
+  registry: Address;
+  rpcUrl: string;
+  logger: Logger;
+}): Promise<Hex> {
+  const result = await addPosition({ ...parameters, dryRun: false, batchShip: false });
+  if (typeof result !== "string") {
+    throw new Error(`配置仓位=${parameters.position.id} 未获得可验证的 ship strategyHash`);
+  }
+  return result;
 }
 
 async function verifyShipReceipt(parameters: {
@@ -402,7 +424,7 @@ async function main(): Promise<void> {
     const preparedShips: PreparedShip[] = [];
     for (const [index, position] of config.positions.entries()) {
       const prepared = await addPosition({ position, index, publicClient, account, chain, chainId: rpcChainId, registry, rpcUrl, dryRun, logger, batchShip });
-      if (prepared) preparedShips.push(prepared);
+      if (prepared && typeof prepared !== "string") preparedShips.push(prepared);
     }
     if (batchShip) {
       await broadcastPreparedShips({ ships: preparedShips, publicClient, account, chain, rpcUrl, registry, dryRun, logger });

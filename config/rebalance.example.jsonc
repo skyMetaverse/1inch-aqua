@@ -22,6 +22,10 @@
     "convertToTwoSidedMinValueRatioBps": 8000
   },
   "runtime": {
-    "stateFile": "state/rebalance-state.json"
+    "stateFile": "state/rebalance-state.json",
+    // 配置目标 LP 数量和缺口初始模板；已有 LP 的重挂模式仍按成交状态动态决定。
+    "lpConfigPath": "config/lp.add.jsonc",
+    // 已确认 ship 等待官方 API 索引的最长秒数，避免同一缺口重复添加。
+    "slotIndexingGraceSeconds": 120
   }
 }

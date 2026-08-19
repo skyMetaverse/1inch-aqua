@@ -4,7 +4,10 @@
  * 主要流程：构造确定性余额和 1e18 价格区间 -> 调用纯函数 -> 断言唯一动作。
  */
 import { expect, test } from "bun:test";
-import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableBlockedPlan, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
+import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableBlockedPlan, reconcileConfiguredPositionSlots, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
+import type { AddLpConfig } from "../src/config/lp-config.ts";
+import type { ApiStrategy } from "../src/infra/aqua-api.ts";
+import type { StateDocument } from "../src/infra/rebalance-state.ts";
 import { decideRebalance, isNearEqualUsd, outsideDistancePercent } from "../src/domain/rebalance.ts";
 import { FIXED_SCALE, parsePercentage } from "../src/domain/fixed.ts";
 
@@ -39,6 +42,34 @@ test("仅安全的 BLOCKED 计划允许重新决策", () => {
   expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "Transaction creation failed.", targetAmountsRaw: ["1", "0"] })).toBe(false);
   expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "ship 回执失败" })).toBe(false);
   expect(isRetryableBlockedPlan({ stage: "DOCK_SENT", blockedReason: "nonce too low" })).toBe(false);
+});
+
+/** 配置只维护数量和补仓模板；已成交策略即便模式变化，也必须继续占用已有配置槽位。 */
+test("配置槽位按 hash 关联并只返回真正缺失的模板", () => {
+  const token0 = "0x111111111117dc0aa78b770fa6a738034120c302" as const;
+  const token1 = "0xdac17f958d2ee523a2206206994597c13d831ec7" as const;
+  const config: AddLpConfig = {
+    chainId: 1,
+    positions: [
+      { id: "two-sided", pair: { tokens: [{ symbol: "A", address: token0, balancePercent: "100%" }, { symbol: "B", address: token1, balancePercent: "100%" }] }, fee: "0.001%", range: { mode: "two-sided", upperPercent: "1%", lowerPercent: "1%" } },
+      { id: "upper", pair: { tokens: [{ symbol: "A", address: token0, balancePercent: "100%" }, { symbol: "B", address: token1, balancePercent: "0%" }] }, fee: "0.001%", range: { mode: "upper", upperPercent: "1%" } },
+      { id: "lower", pair: { tokens: [{ symbol: "A", address: token0, balancePercent: "0%" }, { symbol: "B", address: token1, balancePercent: "100%" }] }, fee: "0.001%", range: { mode: "lower", lowerPercent: "1%" } },
+    ],
+  };
+  const strategy = (hashCharacter: string, openedAt: number) => ({ strategyHash: `0x${hashCharacter.repeat(64)}`, openedAt, tokens: [{ address: token0 }, { address: token1 }] }) as unknown as ApiStrategy;
+  const state: StateDocument = { version: 4, plans: {}, observations: {}, configuredSlots: {} };
+  const missing = reconcileConfiguredPositionSlots({ state, lpConfig: config, strategies: [strategy("a", 1), strategy("b", 2)], indexingGraceMilliseconds: 1_000, now: 10_000 });
+  expect(missing.map((position) => position.id)).toEqual(["lower"]);
+  expect(state.configuredSlots["two-sided"]?.strategyHash).toBe(`0x${"a".repeat(64)}`);
+  expect(state.configuredSlots.upper?.strategyHash).toBe(`0x${"b".repeat(64)}`);
+});
+
+/** API 尚未索引刚确认的 ship 时，宽限期内不能因暂时缺失再创建第二个 LP。 */
+test("配置槽位在 API 索引宽限期内不重复补仓", () => {
+  const config = { chainId: 1, positions: [{ id: "slot", pair: { tokens: [{ symbol: "A", address: "0x111111111117dc0aa78b770fa6a738034120c302" as const, balancePercent: "100%" }, { symbol: "B", address: "0xdac17f958d2ee523a2206206994597c13d831ec7" as const, balancePercent: "0%" }] }, fee: "0.001%", range: { mode: "upper" as const, upperPercent: "1%" } }] } satisfies AddLpConfig;
+  const state: StateDocument = { version: 4, plans: {}, observations: {}, configuredSlots: { slot: { strategyHash: `0x${"c".repeat(64)}`, updatedAt: 9_500 } } };
+  expect(reconcileConfiguredPositionSlots({ state, lpConfig: config, strategies: [], indexingGraceMilliseconds: 1_000, now: 10_000 })).toEqual([]);
+  expect(reconcileConfiguredPositionSlots({ state, lpConfig: config, strategies: [], indexingGraceMilliseconds: 1_000, now: 10_500 }).map((position) => position.id)).toEqual(["slot"]);
 });
 
 test("同一 pair 的不同 strategyHash 使用独立逻辑仓位 key", () => {

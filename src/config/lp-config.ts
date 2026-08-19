@@ -14,6 +14,8 @@ export interface TokenConfig {
 }
 
 export interface PositionConfig {
+  /** 配置仓位的稳定标识；Bot 用它追踪动态重挂后的当前 strategyHash。 */
+  id: string;
   pair: { tokens: [TokenConfig, TokenConfig] };
   fee: string;
   range: {
@@ -76,7 +78,8 @@ function parsePosition(value: unknown, index: number): PositionConfig {
   if (!isRecord(value)) {
     throw new Error(`${fieldName} 必须是对象`);
   }
-  requireOnlyKeys(value, ["pair", "fee", "range"], fieldName);
+  requireOnlyKeys(value, ["id", "pair", "fee", "range"], fieldName);
+  const id = requireString(value.id, `${fieldName}.id`);
   if (!isRecord(value.pair)) {
     throw new Error(`${fieldName}.pair 必须是对象`);
   }
@@ -125,6 +128,7 @@ function parsePosition(value: unknown, index: number): PositionConfig {
   }
 
   return {
+    id,
     pair: { tokens: [token0, token1] },
     fee,
     range: { mode, upperPercent, lowerPercent },
@@ -143,8 +147,16 @@ export function validateAddLpConfig(value: unknown): AddLpConfig {
   if (!Array.isArray(value.positions) || value.positions.length === 0) {
     throw new Error("positions 必须是非空数组");
   }
+  const positions = value.positions.map((position, index) => parsePosition(position, index));
+  const ids = new Set<string>();
+  for (const position of positions) {
+    if (ids.has(position.id)) {
+      throw new Error(`positions.id 不能重复：${position.id}`);
+    }
+    ids.add(position.id);
+  }
   return {
     chainId: value.chainId as number,
-    positions: value.positions.map((position, index) => parsePosition(position, index)),
+    positions,
   };
 }

@@ -13,6 +13,7 @@ import { getDecryptedPrivateKey } from "../../scripts/encrypt-private-key.ts";
 import { buildConcentratedStrategy } from "../aqua/strategy.ts";
 import { parseConcentratedSqrtRange } from "../aqua/strategy-parser.ts";
 import { validateRebalanceConfig, type RebalanceConfig } from "../config/rebalance-config.ts";
+import { validateAddLpConfig, type AddLpConfig, type PositionConfig } from "../config/lp-config.ts";
 import { readJsoncFile } from "../config/jsonc.ts";
 import { calculateDisplayRange, convertAquaSqrtRangeToDisplayRange, convertDisplayRangeToAquaSqrtRange, formatFixed, parseDecimal, parseDecimalFloor, parsePercentage, percentageToAquaFeeValue } from "../domain/fixed.ts";
 import { decideRebalance, outsideDistancePercent, relativePriceDeviationPercent, type RebalanceMode } from "../domain/rebalance.ts";
@@ -23,7 +24,7 @@ import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { RebalanceTerminalDashboard, type DashboardStatus, type RebalanceDashboardRow } from "../infra/rebalance-terminal.ts";
 import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
 import { acquireRebalanceLock, loadRebalanceState, saveRebalanceState, type PersistedPlan, type StateDocument } from "../infra/rebalance-state.ts";
-import { ensureMaximumAllowance } from "./add-lp.ts";
+import { addConfiguredPosition, ensureMaximumAllowance } from "./add-lp.ts";
 
 const DEFAULT_CONFIG_PATH = "config/rebalance.jsonc";
 const ENV_FILE = ".env";
@@ -114,6 +115,55 @@ export function installRebalanceTerminationHandler(source: RebalanceTerminationS
 function positionIdentity(strategy: Pick<LogicalPositionInput, "chainId" | "maker" | "app" | "tokens">): string { return `${strategy.chainId}:${strategy.maker.toLowerCase()}:${strategy.app.toLowerCase()}:${[strategy.tokens[0].address, strategy.tokens[1].address].map((value) => value.toLowerCase()).sort().join(":")}`; }
 function marketKey(tokens: [{ address: Address }, { address: Address }]): string { return `${tokens[0].address.toLowerCase()}:${tokens[1].address.toLowerCase()}`; }
 
+/** 配置对账只关心同一交易对，不依赖 token 顺序或已成交后的单边/双边模式。 */
+function configuredPairKey(tokens: readonly { address: Address }[]): string {
+  return tokens.map((token) => token.address.toLowerCase()).sort().join(":");
+}
+
+/** 找到某个当前或历史 strategyHash 所属的配置模板；模板仅用于补足数量，不干预动态重挂模式。 */
+export function configuredPositionIdForStrategyHash(state: StateDocument, strategyHash: string): string | undefined {
+  return Object.entries(state.configuredSlots).find(([, slot]) => slot.strategyHash?.toLowerCase() === strategyHash.toLowerCase())?.[0];
+}
+
+/** 只要配置槽位有未完成计划，就必须先恢复同一份 dock/ship，不能并发创建第二个替代仓位。 */
+function hasPendingConfiguredSlotPlan(state: StateDocument, positionId: string): boolean {
+  return Object.values(state.plans).some((plan) => plan.configuredPositionId === positionId && plan.stage !== "ACTIVE_LATEST");
+}
+
+/**
+ * 用 API 活跃快照对齐配置槽位，并返回需要按初始模板补建的槽位。
+ * 首次升级缺少历史关联时，同 pair 的活跃策略按 openedAt/hash 稳定分配给未占用模板；之后关联随 ship 新 hash 持续迁移，动态模式不参与判断。
+ */
+export function reconcileConfiguredPositionSlots(parameters: { state: StateDocument; lpConfig: AddLpConfig; strategies: readonly ApiStrategy[]; indexingGraceMilliseconds: number; now?: number }): PositionConfig[] {
+  const now = parameters.now ?? Date.now();
+  const configuredIds = new Set(parameters.lpConfig.positions.map((position) => position.id));
+  for (const slotId of Object.keys(parameters.state.configuredSlots)) {
+    if (!configuredIds.has(slotId)) delete parameters.state.configuredSlots[slotId];
+  }
+  const active = parameters.strategies.filter((strategy) => parameters.lpConfig.positions.some((position) => configuredPairKey(position.pair.tokens) === configuredPairKey(strategy.tokens)));
+  const activeByHash = new Map(active.map((strategy) => [strategy.strategyHash.toLowerCase(), strategy]));
+  const assigned = new Set<string>();
+  for (const position of parameters.lpConfig.positions) {
+    const slot = parameters.state.configuredSlots[position.id];
+    if (!slot?.strategyHash) continue;
+    if (activeByHash.has(slot.strategyHash.toLowerCase())) {
+      assigned.add(slot.strategyHash.toLowerCase());
+      continue;
+    }
+    // 新 ship 已经链上确认但 API 尚未索引时，不得按“缺失”再添加同一配置仓位。
+    if (!hasPendingConfiguredSlotPlan(parameters.state, position.id) && now - slot.updatedAt >= parameters.indexingGraceMilliseconds) {
+      parameters.state.configuredSlots[position.id] = { updatedAt: now };
+    }
+  }
+  const unassigned = active.filter((strategy) => !assigned.has(strategy.strategyHash.toLowerCase())).sort((left, right) => left.openedAt - right.openedAt || left.strategyHash.localeCompare(right.strategyHash));
+  for (const strategy of unassigned) {
+    const position = parameters.lpConfig.positions.find((candidate) => !parameters.state.configuredSlots[candidate.id]?.strategyHash && !hasPendingConfiguredSlotPlan(parameters.state, candidate.id) && configuredPairKey(candidate.pair.tokens) === configuredPairKey(strategy.tokens));
+    if (!position) continue;
+    parameters.state.configuredSlots[position.id] = { strategyHash: strategy.strategyHash, updatedAt: now };
+  }
+  return parameters.lpConfig.positions.filter((position) => !parameters.state.configuredSlots[position.id]?.strategyHash && !hasPendingConfiguredSlotPlan(parameters.state, position.id));
+}
+
 /** 同一 pair 的不同 strategyHash 是不同 Aqua 仓位，必须拥有独立观察计数和恢复计划。 */
 type LogicalPositionInput = { chainId: number; maker: Address; app: Address; tokens: [{ address: Address }, { address: Address }]; strategyHash: Hex };
 export function buildLogicalPositionKey(parameters: LogicalPositionInput): string { return `${positionIdentity(parameters)}:${parameters.strategyHash.toLowerCase()}`; }
@@ -187,9 +237,12 @@ function updatePlan(state: StateDocument, plan: PersistedPlan, config: Rebalance
 
 /** 重挂完成后把冷却观察迁移到新 strategyHash，旧计划仍作为 API 索引延迟期间的保护别名。 */
 function registerCompletedObservation(state: StateDocument, plan: PersistedPlan, newStrategyHash: string, config: RebalanceConfig): void {
+  const now = Date.now();
   const nextKey = keyWithStrategyHash(plan.logicalPositionKey, newStrategyHash);
-  state.observations[nextKey] = { strategyHash: newStrategyHash, breachCount: 0, lastShipAt: Date.now() };
-  state.plans[plan.logicalPositionKey] = { ...plan, shipStrategyHash: newStrategyHash, stage: "ACTIVE_LATEST", updatedAt: Date.now() };
+  state.observations[nextKey] = { strategyHash: newStrategyHash, breachCount: 0, lastShipAt: now };
+  state.plans[plan.logicalPositionKey] = { ...plan, shipStrategyHash: newStrategyHash, stage: "ACTIVE_LATEST", updatedAt: now };
+  // 只迁移关联 hash，不写回 targetMode；后续重挂仍由当前成交余额动态决定。
+  if (plan.configuredPositionId) state.configuredSlots[plan.configuredPositionId] = { strategyHash: newStrategyHash, updatedAt: now };
   saveRebalanceState(config.runtime.stateFile, state);
 }
 function logRange(logger: Logger, strategy: ApiStrategy, range: { min: bigint; current: bigint; max: bigint }, prefix: string): void { logger.info(`${prefix}：1 ${strategy.tokens[0].symbol} = ${formatFixed(range.min)} 至 ${formatFixed(range.max)} ${strategy.tokens[1].symbol}；current=1 ${strategy.tokens[0].symbol} = ${formatFixed(range.current)} ${strategy.tokens[1].symbol}`); }
@@ -422,15 +475,29 @@ async function executeShip(parameters: { plan: PersistedPlan; state: StateDocume
 }
 
 /**
+ * 补足配置中缺失的 LP。该路径仅使用配置模板初始创建新仓位；已经存在的策略不会被此函数重置模式或资金比例。
+ * 单个模板完整成功后立即持久化 hash，失败则保留空槽位供下一轮重试，避免批量交易中部分成功后失去关联。
+ */
+async function replenishConfiguredPositions(parameters: { missing: readonly PositionConfig[]; state: StateDocument; config: RebalanceConfig; client: ReturnType<typeof createPublicClient>; account: PrivateKeyAccount; chain: Chain; registry: Address; rpcUrl: string; logger: Logger }): Promise<void> {
+  for (const position of parameters.missing) {
+    parameters.logger.info(`检测到配置 LP 缺口：配置槽位=${position.id}，按 lp.add 模板创建初始仓位`);
+    const strategyHash = await addConfiguredPosition({ position, index: 0, publicClient: parameters.client, account: parameters.account, chain: parameters.chain, chainId: parameters.config.chainId, registry: parameters.registry, rpcUrl: parameters.rpcUrl, logger: parameters.logger });
+    parameters.state.configuredSlots[position.id] = { strategyHash, updatedAt: Date.now() };
+    saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
+    parameters.logger.info(`配置 LP 缺口已补足：配置槽位=${position.id}，strategyHash=${strategyHash}`);
+  }
+}
+
+/**
  * 从一次 API/市场快照构造 dock 计划。API currentBalance.raw 只冻结为旧策略链上核验基准，绝不作为新策略投入额。
  * 新策略金额、salt 与 hash 必须等 dock 已确认后，以钱包真实余额在 SHIP_PREPARED 阶段一次性冻结。
  */
-function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint, config: RebalanceConfig, oldRange: { min: bigint; max: bigint }, reason: string): PersistedPlan {
+function createPlan(strategy: ApiStrategy, mode: RebalanceMode, current: bigint, config: RebalanceConfig, oldRange: { min: bigint; max: bigint }, reason: string, configuredPositionId?: string): PersistedPlan {
   const range = displayRangeForMode(current, mode, config);
   // API 的 decimals 是策略元数据的一部分；缺失或漂移已在 API 适配层拒绝，不能退化为 rawPrice 重挂。
   const aquaRange = convertDisplayRangeToAquaSqrtRange(strategy.tokens[0].address, strategy.tokens[0].decimals, strategy.tokens[1].address, strategy.tokens[1].decimals, range);
   const now = Date.now();
-  return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetSqrtPriceMin: aquaRange.sqrtPriceMin.toString(), targetSqrtPriceMax: aquaRange.sqrtPriceMax.toString(), fee: config.rebalance.fee, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED" };
+  return { logicalPositionKey: logicalKey(strategy), sourceStrategyHash: strategy.strategyHash, sourceStrategyBytes: strategy.strategyBytes, sourceApp: strategy.app, tokens: [strategy.tokens[0].address, strategy.tokens[1].address], sourceCurrentRaw: [strategy.tokens[0].currentBalance.raw.toString(), strategy.tokens[1].currentBalance.raw.toString()], targetMode: mode, targetSqrtPriceMin: aquaRange.sqrtPriceMin.toString(), targetSqrtPriceMax: aquaRange.sqrtPriceMax.toString(), fee: config.rebalance.fee, decisionReason: `${reason}；旧区间=${formatFixed(oldRange.min)}-${formatFixed(oldRange.max)}，新区间=${formatFixed(range.min)}-${formatFixed(range.max)}`, createdAt: now, updatedAt: now, stage: "PLAN_PERSISTED", ...(configuredPositionId === undefined ? {} : { configuredPositionId }) };
 }
 
 /** 每轮处理 API 返回的完整仓位集合；每个 strategyHash 都是独立仓位，同 pair 不再互相跳过。illiquidity 会在价格读取后直接创建重挂计划。 */
@@ -489,7 +556,15 @@ async function processSnapshot(parameters: { strategies: ApiStrategy[]; config: 
       parameters.terminal?.upsert(dashboardRow(strategy, oldRange, outside, breachCount, parameters.config.polling.stableSnapshotsRequired, priceDeviation, decision));
       const pairSummary = market ? `Pair volumeUsd=${market.volumeUsd}，swaps=${market.swaps}，Pair/EMSH 偏离=${formatFixed(priceDeviation ?? 0n)}%` : "Pair 市场未读取（illiquidity 直接重挂）";
       parameters.logger.info(`监控 strategyHash=${strategy.strategyHash}，${pairSummary}，越界=${formatFixed(outside)}%，连续=${breachCount}/${parameters.config.polling.stableSnapshotsRequired}，决定=${decision.action}，原因=${decision.reason}`); logRange(parameters.logger, strategy, oldRange, "旧策略区间");
-      if (decision.action === "rehang") { const plan = createPlan(strategy, decision.targetMode, current, parameters.config, oldRange, decision.reason); parameters.state.plans[key] = plan; saveRebalanceState(parameters.config.runtime.stateFile, parameters.state); parameters.logger.info(`已生成自动计划：旧=${plan.sourceStrategyHash}，模式=${plan.targetMode}，新策略金额与 hash 将在 dock 确认后按钱包实际余额冻结，原因=${plan.decisionReason}`); await parameters.execute(plan); }
+      if (decision.action === "rehang") {
+        // 配置槽位关联只随计划迁移 hash，targetMode 仍完整保留本轮的动态成交决策。
+        const configuredPositionId = configuredPositionIdForStrategyHash(parameters.state, strategy.strategyHash);
+        const plan = createPlan(strategy, decision.targetMode, current, parameters.config, oldRange, decision.reason, configuredPositionId);
+        parameters.state.plans[key] = plan;
+        saveRebalanceState(parameters.config.runtime.stateFile, parameters.state);
+        parameters.logger.info(`已生成自动计划：旧=${plan.sourceStrategyHash}，模式=${plan.targetMode}，配置槽位=${configuredPositionId ?? "未关联"}，新策略金额与 hash 将在 dock 确认后按钱包实际余额冻结，原因=${plan.decisionReason}`);
+        await parameters.execute(plan);
+      }
       if (decision.action === "block") parameters.logger.info(`阻止 strategyHash=${strategy.strategyHash}：${decision.reason}`);
     } catch (error) { const message = error instanceof Error ? error.message.split("\n")[0] : "未知错误"; parameters.logger.info(`跳过 strategyHash=${strategy.strategyHash}：${message}`); }
   }
@@ -507,7 +582,9 @@ async function main(): Promise<void> {
   const logger = terminal.enabled ? createDashboardLogger(auditLogger, terminal) : auditLogger;
   activeLogger = logger;
   const config = validateRebalanceConfig(readJsoncFile(configPath));
-  logger.info(`启动自动再平衡 Bot：配置=${configPath}，chainId=${config.chainId}，日志=${logger.filePath}`);
+  const lpConfig = validateAddLpConfig(readJsoncFile(config.runtime.lpConfigPath));
+  if (lpConfig.chainId !== config.chainId) throw new Error(`LP 配置 chainId=${lpConfig.chainId} 与 rebalance 配置 chainId=${config.chainId} 不一致`);
+  logger.info(`启动自动再平衡 Bot：配置=${configPath}，LP 模板=${config.runtime.lpConfigPath}，目标仓位数=${lpConfig.positions.length}，chainId=${config.chainId}，日志=${logger.filePath}`);
   let release: (() => void) | undefined;
   let privateKey: Buffer | undefined;
   let cleaned = false;
@@ -561,8 +638,9 @@ async function main(): Promise<void> {
           return;
         }
         const latest = state.plans[plan.logicalPositionKey] ?? plan;
-        if (latest.stage === "DOCK_VERIFIED" || latest.stage === "SHIP_PREPARED") {
-          logger.info(`ship 尚未广播，保留原计划供下一轮恢复：逻辑仓位=${plan.logicalPositionKey}，原因=${message}`);
+        if (latest.stage === "DOCK_SENT" || latest.stage === "DOCK_VERIFIED" || latest.stage === "SHIP_PREPARED" || latest.stage === "SHIP_SENT") {
+          // 广播过 dock/ship 后的 RPC 读取错误不能覆盖原阶段；下一轮必须只读恢复同一笔交易，禁止补建第二个仓位。
+          logger.info(`存在已广播或已冻结的计划，保留原计划供下一轮恢复：逻辑仓位=${plan.logicalPositionKey}，阶段=${latest.stage}，原因=${message}`);
           return;
         }
         state.plans[plan.logicalPositionKey] = { ...latest, stage: "BLOCKED", blockedReason: message, updatedAt: Date.now() };
@@ -580,12 +658,16 @@ async function main(): Promise<void> {
         }
         const strategies = await getActiveStrategies(account.address, chainId);
         logger.info(`官方策略 API 返回 open 仓位数=${strategies.length}`);
+        const missingConfiguredPositions = reconcileConfiguredPositionSlots({ state, lpConfig, strategies, indexingGraceMilliseconds: config.runtime.slotIndexingGraceSeconds * 1000 });
+        saveRebalanceState(config.runtime.stateFile, state);
+        logger.info(`配置 LP 对账完成：目标=${lpConfig.positions.length}，已关联=${lpConfig.positions.length - missingConfiguredPositions.length}，待补足=${missingConfiguredPositions.length}`);
         if (!allowancePreflightCompleted) {
           const authorizationStrategies = strategies.filter((strategy) => unsupportedStrategyReason(strategy, account.address, config.chainId, app) === null);
           await primeMaximumAllowanceCache({ client, strategies: authorizationStrategies, owner: account.address, registry, cache: maximumAllowanceCache, logger });
           allowancePreflightCompleted = true;
           logger.info(`启动授权预检完成：最大授权 token 数=${maximumAllowanceCache.size}`);
         }
+        await replenishConfiguredPositions({ missing: missingConfiguredPositions, state, config, client, account, chain, registry, rpcUrl, logger });
         await processSnapshot({ strategies, config, state, account, app, logger, terminal, execute });
         terminal.render();
       } catch (error) {

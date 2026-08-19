@@ -34,10 +34,18 @@ export interface PersistedPlan {
   dockTransactionHash?: string;
   shipTransactionHash?: string;
   blockedReason?: string;
+  /** 触发此计划的配置槽位；缺口补仓只使用该关联，不约束动态重挂模式。 */
+  configuredPositionId?: string;
 }
 
 export interface RebalanceObservation { strategyHash: string; breachCount: number; lastShipAt?: number; }
-export interface StateDocument { version: 3; plans: Record<string, PersistedPlan>; observations: Record<string, RebalanceObservation>; }
+export interface ConfiguredPositionSlot {
+  /** 最近一次成功 ship 的 strategyHash；API 索引延迟期间仍保留该关联，避免重复补仓。 */
+  strategyHash?: string;
+  updatedAt: number;
+}
+
+export interface StateDocument { version: 4; plans: Record<string, PersistedPlan>; observations: Record<string, RebalanceObservation>; configuredSlots: Record<string, ConfiguredPositionSlot>; }
 
 function record(value: unknown, field: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${field} 必须是对象`);
@@ -107,6 +115,7 @@ function parsePlan(value: unknown, key: string): PersistedPlan {
     ...(typeof plan.dockTransactionHash === "string" ? { dockTransactionHash: plan.dockTransactionHash } : {}),
     ...(typeof plan.shipTransactionHash === "string" ? { shipTransactionHash: plan.shipTransactionHash } : {}),
     ...(typeof plan.blockedReason === "string" ? { blockedReason: plan.blockedReason } : {}),
+    ...(typeof plan.configuredPositionId === "string" ? { configuredPositionId: plan.configuredPositionId } : {}),
   };
 }
 
@@ -164,12 +173,12 @@ function parseObservations(value: unknown): Record<string, RebalanceObservation>
 
 /** 读取严格状态；v2 在任何恢复动作前原子升级为 v3，v1 rawPrice 状态始终拒绝。 */
 export function loadRebalanceState(path: string): StateDocument {
-  if (!existsSync(path)) return { version: 3, plans: {}, observations: {} };
+  if (!existsSync(path)) return { version: 4, plans: {}, observations: {}, configuredSlots: {} };
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(path, "utf8")); } catch { throw new Error(`状态文件无法解析：${path}`); }
   const root = record(parsed, "状态文件根节点");
   if (root.version === 1) throw new Error("状态文件为 v1 rawPrice 格式，无法安全恢复 mixed-decimals 计划；请人工核对后归档该 state 文件");
-  if ((root.version !== 2 && root.version !== 3) || typeof root.plans !== "object" || root.plans === null || Array.isArray(root.plans) || typeof root.observations !== "object" || root.observations === null || Array.isArray(root.observations)) {
+  if ((root.version !== 2 && root.version !== 3 && root.version !== 4) || typeof root.plans !== "object" || root.plans === null || Array.isArray(root.plans) || typeof root.observations !== "object" || root.observations === null || Array.isArray(root.observations)) {
     throw new Error("状态文件版本、plans 或 observations 无效");
   }
   const rawPlans = root.plans as Record<string, unknown>;
@@ -178,8 +187,18 @@ export function loadRebalanceState(path: string): StateDocument {
     const parsedPlan = parsePlan(value, key);
     plans[key] = validateV3Plan(root.version === 2 ? migrateV2Plan(parsedPlan) : parsedPlan, key);
   }
-  const state: StateDocument = { version: 3, plans, observations: parseObservations(root.observations) };
-  if (root.version === 2) saveRebalanceState(path, state);
+  const configuredSlots: Record<string, ConfiguredPositionSlot> = {};
+  if (root.configuredSlots !== undefined) {
+    const rawSlots = record(root.configuredSlots, "状态 configuredSlots");
+    for (const [slotId, value] of Object.entries(rawSlots)) {
+      const slot = record(value, `状态配置仓位 ${slotId}`);
+      if (slot.strategyHash !== undefined && (typeof slot.strategyHash !== "string" || slot.strategyHash === "")) throw new Error(`状态配置仓位 ${slotId}.strategyHash 无效`);
+      if (!Number.isSafeInteger(slot.updatedAt) || (slot.updatedAt as number) < 0) throw new Error(`状态配置仓位 ${slotId}.updatedAt 无效`);
+      configuredSlots[slotId] = { ...(slot.strategyHash === undefined ? {} : { strategyHash: slot.strategyHash as string }), updatedAt: slot.updatedAt as number };
+    }
+  }
+  const state: StateDocument = { version: 4, plans, observations: parseObservations(root.observations), configuredSlots };
+  if (root.version === 2 || root.version === 3) saveRebalanceState(path, state);
   return state;
 }
 

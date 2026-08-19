@@ -10,7 +10,7 @@ export interface RebalanceConfig {
   polling: { intervalSeconds: number; stableSnapshotsRequired: number; maxCurrentPriceAgeSeconds: number };
   market: { maxPairPriceDeviationPercent: string; minimumPairSwaps: number };
   rebalance: { fee: string; singleSidedWidth: string; twoSidedHalfWidth: string; recenterExcess: string; cooldownSeconds: number; convertToTwoSidedMinValueRatioBps: number };
-  runtime: { stateFile: string };
+  runtime: { stateFile: string; lpConfigPath: string; slotIndexingGraceSeconds: number };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -31,14 +31,16 @@ export function validateRebalanceConfig(value: unknown): RebalanceConfig {
   if (!isRecord(value.rebalance)) throw new Error("rebalance 必须是对象");
   onlyKeys(value.rebalance, ["fee", "singleSidedWidth", "twoSidedHalfWidth", "recenterExcess", "cooldownSeconds", "convertToTwoSidedMinValueRatioBps"], "rebalance");
   if (!isRecord(value.runtime)) throw new Error("runtime 必须是对象");
-  onlyKeys(value.runtime, ["stateFile"], "runtime");
+  onlyKeys(value.runtime, ["stateFile", "lpConfigPath", "slotIndexingGraceSeconds"], "runtime");
   const ratio = positiveInteger(value.rebalance.convertToTwoSidedMinValueRatioBps, "rebalance.convertToTwoSidedMinValueRatioBps");
   if (ratio > 10_000) throw new Error("rebalance.convertToTwoSidedMinValueRatioBps 不能超过 10000");
+  const lpConfigPath = value.runtime.lpConfigPath === undefined ? "config/lp.add.jsonc" : stringValue(value.runtime.lpConfigPath, "runtime.lpConfigPath");
+  const slotIndexingGraceSeconds = value.runtime.slotIndexingGraceSeconds === undefined ? 120 : positiveInteger(value.runtime.slotIndexingGraceSeconds, "runtime.slotIndexingGraceSeconds");
   return {
     chainId,
     polling: { intervalSeconds: positiveInteger(value.polling.intervalSeconds, "polling.intervalSeconds"), stableSnapshotsRequired: positiveInteger(value.polling.stableSnapshotsRequired, "polling.stableSnapshotsRequired"), maxCurrentPriceAgeSeconds: positiveInteger(value.polling.maxCurrentPriceAgeSeconds, "polling.maxCurrentPriceAgeSeconds") },
     market: { maxPairPriceDeviationPercent: percent(value.market.maxPairPriceDeviationPercent, "market.maxPairPriceDeviationPercent"), minimumPairSwaps: positiveInteger(value.market.minimumPairSwaps, "market.minimumPairSwaps") },
     rebalance: { fee: percent(value.rebalance.fee, "rebalance.fee"), singleSidedWidth: percent(value.rebalance.singleSidedWidth, "rebalance.singleSidedWidth"), twoSidedHalfWidth: percent(value.rebalance.twoSidedHalfWidth, "rebalance.twoSidedHalfWidth"), recenterExcess: percent(value.rebalance.recenterExcess, "rebalance.recenterExcess"), cooldownSeconds: positiveInteger(value.rebalance.cooldownSeconds, "rebalance.cooldownSeconds"), convertToTwoSidedMinValueRatioBps: ratio },
-    runtime: { stateFile: stringValue(value.runtime.stateFile, "runtime.stateFile") },
+    runtime: { stateFile: stringValue(value.runtime.stateFile, "runtime.stateFile"), lpConfigPath, slotIndexingGraceSeconds },
   };
 }
