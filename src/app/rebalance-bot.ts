@@ -22,7 +22,7 @@ import { MAX_UINT256, readTokenAllowance, readTokenBalance } from "../infra/erc2
 import { getCurrentPrice } from "../infra/emsh.ts";
 import { createLogger, formatLogLine, type Logger } from "../infra/logger.ts";
 import { RebalanceTerminalDashboard, type DashboardStatus, type RebalanceDashboardRow } from "../infra/rebalance-terminal.ts";
-import { RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
+import { PreBroadcastTransactionError, RawBroadcastIndeterminateError, sendLocallySignedTransaction, type TransactionRequest } from "../infra/rpc.ts";
 import { acquireRebalanceLock, loadRebalanceState, saveRebalanceState, type PersistedPlan, type StateDocument } from "../infra/rebalance-state.ts";
 import { addConfiguredPositions, ensureMaximumAllowance } from "./add-lp.ts";
 
@@ -86,6 +86,23 @@ export function isRetryableBlockedPlan(plan: Pick<PersistedPlan, "stage" | "bloc
     && !plan.targetAmountsRaw
     && !plan.shipStrategyHash;
   return isPreBroadcastRpcCreationFailure;
+}
+
+/** 无 hash 的 DOCK_SENT 只有尚未冻结 ship 且链上确认旧策略仍 active 时才允许重试；其余情况保持停止。 */
+export function isRetryableUnbroadcastDockPlan(plan: Pick<PersistedPlan, "stage" | "dockTransactionHash" | "shipTransactionHash" | "walletBalancesRaw" | "targetAmountsRaw" | "shipStrategyHash">): boolean {
+  return plan.stage === "DOCK_SENT"
+    && !plan.dockTransactionHash
+    && !plan.shipTransactionHash
+    && !plan.walletBalancesRaw
+    && !plan.targetAmountsRaw
+    && !plan.shipStrategyHash;
+}
+
+/** ship 已冻结金额但尚未产生交易 hash 时，只有明确的广播前错误才能回滚到 SHIP_PREPARED 重试。 */
+export function isRetryableUnbroadcastShipPlan(plan: Pick<PersistedPlan, "stage" | "shipTransactionHash" | "walletBalancesRaw" | "targetAmountsRaw" | "salt" | "shipStrategyHash">): boolean {
+  return plan.stage === "SHIP_SENT"
+    && !plan.shipTransactionHash
+    && Boolean(plan.walletBalancesRaw && plan.targetAmountsRaw && plan.salt && plan.shipStrategyHash);
 }
 
 /** 以最小信号接口隔离 process，允许测试验证 Ctrl+C/服务停止会进入同一清理路径。 */
@@ -306,13 +323,12 @@ async function verifyApiSnapshotOnChain(client: ReturnType<typeof createPublicCl
   }
 }
 
-/** 判断旧策略是否已完整 dock；恢复 DOCK_SENT 时仅以该链上终态判定，不能再次发送 dock。 */
-async function oldStrategyDocked(client: ReturnType<typeof createPublicClient>, registry: Address, account: Address, plan: PersistedPlan): Promise<boolean> {
-  for (const token of plan.tokens) {
-    const result = await client.readContract({ address: registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [account, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, requireAddress(token, "计划 token")] }) as unknown as readonly [bigint, number];
-    if (result[0] !== 0n || result[1] !== DOCKED_TOKENS_COUNT) return false;
-  }
-  return true;
+/** 读取旧策略链上状态；无交易 hash 的恢复只有在明确仍为 active 时才允许重发 dock。 */
+async function readOldStrategyState(client: ReturnType<typeof createPublicClient>, registry: Address, account: Address, plan: PersistedPlan): Promise<"ACTIVE" | "DOCKED"> {
+  const results = await Promise.all(plan.tokens.map((token) => client.readContract({ address: registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [account, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, requireAddress(token, "计划 token")] }) as unknown as Promise<readonly [bigint, number]>));
+  if (results.every(([balance, tokensCount]) => balance === 0n && tokensCount === DOCKED_TOKENS_COUNT)) return "DOCKED";
+  if (results.every(([, tokensCount]) => tokensCount === 2)) return "ACTIVE";
+  throw new Error(`旧策略链上状态不一致，拒绝自动重发 dock：strategyHash=${plan.sourceStrategyHash}`);
 }
 
 /** 判断持久化新 hash 是否已完整 ship；恢复 SHIP_SENT 时只要成立便完成，不会重发。 */
@@ -344,23 +360,36 @@ async function executeDock(parameters: { plan: PersistedPlan; state: StateDocume
   let { plan } = parameters; if (plan.stage === "DOCK_VERIFIED" || plan.stage === "SHIP_PREPARED" || plan.stage === "SHIP_SENT" || plan.stage === "ACTIVE_LATEST") return plan;
   const storedHash = AquaProtocolContract.calculateStrategyHash(new HexString(plan.sourceStrategyBytes)).toString();
   if (storedHash.toLowerCase() !== plan.sourceStrategyHash.toLowerCase()) throw new Error("持久化计划的 sourceStrategyBytes hash 不一致");
+  let retryUnbroadcastDock = false;
   if (plan.stage === "DOCK_SENT") {
-    if (!plan.dockTransactionHash) throw new Error("恢复 dock 计划缺少交易哈希，已停止避免重复广播");
-    const receipt = await parameters.client.waitForTransactionReceipt({ hash: plan.dockTransactionHash as Hex, confirmations: 1 });
-    if (receipt.status !== "success") throw new Error(`恢复 dock 回执失败：${plan.dockTransactionHash}`);
-    const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>;
-    if (!hasEvent(logs, parameters.registry, parameters.account.address, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, "docked")) throw new Error("恢复 dock 回执缺少匹配 Docked 事件");
-    if (!await oldStrategyDocked(parameters.client, parameters.registry, parameters.account.address, plan)) throw new Error("恢复 dock 后链上状态未进入 docked");
-    plan = { ...plan, stage: "DOCK_VERIFIED", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`恢复 dock 成功：strategyHash=${plan.sourceStrategyHash}`); return plan;
+    if (plan.dockTransactionHash) {
+      const receipt = await parameters.client.waitForTransactionReceipt({ hash: plan.dockTransactionHash as Hex, confirmations: 1 });
+      if (receipt.status !== "success") throw new Error(`恢复 dock 回执失败：${plan.dockTransactionHash}`);
+      const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>;
+      if (!hasEvent(logs, parameters.registry, parameters.account.address, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, "docked")) throw new Error("恢复 dock 回执缺少匹配 Docked 事件");
+      if (await readOldStrategyState(parameters.client, parameters.registry, parameters.account.address, plan) !== "DOCKED") throw new Error("恢复 dock 后链上状态未进入 docked");
+      plan = { ...plan, stage: "DOCK_VERIFIED", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`恢复 dock 成功：strategyHash=${plan.sourceStrategyHash}`); return plan;
+    }
+    if (!isRetryableUnbroadcastDockPlan(plan)) throw new Error("恢复 dock 计划缺少交易哈希且存在后续资金字段，已停止避免重复广播");
+    // 旧版本可能在 fee/签名前误写 DOCK_SENT；链上仍 active 时明确证明 dock 未执行，可以重试同一计划。
+    const oldState = await readOldStrategyState(parameters.client, parameters.registry, parameters.account.address, plan);
+    if (oldState === "DOCKED") {
+      plan = { ...plan, stage: "DOCK_VERIFIED", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`恢复 dock 状态已确认：strategyHash=${plan.sourceStrategyHash}`); return plan;
+    }
+    retryUnbroadcastDock = true;
+    parameters.logger.info(`恢复无交易哈希的 dock 计划：旧策略仍 active，确认未成功广播，重试 strategyHash=${plan.sourceStrategyHash}`);
   }
-  await verifyApiSnapshotOnChain(parameters.client, parameters.registry, parameters.account.address, plan);
+  // 无 hash 的历史计划已用链上状态确认仍 active；不能再用过期 API 快照阻断本次重试。
+  if (!retryUnbroadcastDock) await verifyApiSnapshotOnChain(parameters.client, parameters.registry, parameters.account.address, plan);
   const aqua = new AquaProtocolContract(new AquaAddress(parameters.registry)); const dock = aqua.dock({ app: new AquaAddress(plan.sourceApp), strategyHash: new HexString(plan.sourceStrategyHash), tokens: plan.tokens.map((token) => new AquaAddress(token)) });
   const to = dock.to.toString() as Address; const data = dock.data.toString() as Hex;
   await parameters.client.call({ account: parameters.account.address, to, data, value: dock.value });
   parameters.logger.info(`dock 链上模拟成功：strategyHash=${plan.sourceStrategyHash}`);
+  // 广播前先落盘保护进程崩溃窗口；若 fee/签名阶段失败，外层只将该阶段回滚为 PLAN_PERSISTED。
   plan = { ...plan, stage: "DOCK_SENT", updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config);
   const transactionHash = await sendOrReconcileBroadcast({ account: parameters.account, chain: parameters.chain, rpcUrl: parameters.rpcUrl, transaction: { to, data, value: dock.value }, logger: parameters.logger, action: `dock strategyHash=${plan.sourceStrategyHash}` });
-  plan = { ...plan, dockTransactionHash: transactionHash, updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config); parameters.logger.info(`dock 已广播：strategyHash=${plan.sourceStrategyHash}，交易哈希=${transactionHash}`);
+  plan = { ...plan, dockTransactionHash: transactionHash, updatedAt: Date.now() }; updatePlan(parameters.state, plan, parameters.config);
+  parameters.logger.info(`dock 已广播：strategyHash=${plan.sourceStrategyHash}，交易哈希=${transactionHash}`);
   const receipt = await parameters.client.waitForTransactionReceipt({ hash: transactionHash, confirmations: 1 }); if (receipt.status !== "success") throw new Error(`dock 回执失败：${transactionHash}`);
   const logs = receipt.logs as unknown as ReadonlyArray<{ address: Address; data: Hex; topics: readonly Hex[] }>; if (!hasEvent(logs, parameters.registry, parameters.account.address, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, "docked")) throw new Error("dock 回执缺少匹配 Docked 事件");
   for (const token of plan.tokens) { const result = await parameters.client.readContract({ address: parameters.registry, abi: AquaAbi.AQUA_ABI, functionName: "rawBalances", args: [parameters.account.address, requireAddress(plan.sourceApp, "计划 sourceApp"), plan.sourceStrategyHash as Hex, requireAddress(token, "计划 token")] }) as unknown as readonly [bigint, number]; if (result[0] !== 0n || result[1] !== DOCKED_TOKENS_COUNT) throw new Error(`dock 后链上复核失败：token=${token}`); }
@@ -642,6 +671,22 @@ async function main(): Promise<void> {
           return;
         }
         const latest = state.plans[plan.logicalPositionKey] ?? plan;
+        if (error instanceof PreBroadcastTransactionError && latest.stage === "DOCK_SENT" && isRetryableUnbroadcastDockPlan(latest)) {
+          // dock 的 fee/nonce/gas/签名阶段尚未调用 eth_sendRawTransaction；回滚预广播保护阶段，下一轮重试同一计划。
+          const retryPlan = { ...latest, stage: "PLAN_PERSISTED" as const, updatedAt: Date.now() };
+          delete retryPlan.blockedReason;
+          state.plans[plan.logicalPositionKey] = retryPlan;
+          saveRebalanceState(config.runtime.stateFile, state);
+          logger.info(`交易广播前准备失败，下一轮重试原计划：逻辑仓位=${plan.logicalPositionKey}，阶段=${latest.stage}，原因=${message}`);
+          return;
+        }
+        if (error instanceof PreBroadcastTransactionError && latest.stage === "SHIP_SENT" && isRetryableUnbroadcastShipPlan(latest)) {
+          // ship 的 fee/nonce/gas/签名阶段同样尚未广播；保留冻结金额、salt 和 hash，只回滚发送阶段。
+          state.plans[plan.logicalPositionKey] = { ...latest, stage: "SHIP_PREPARED", updatedAt: Date.now() };
+          saveRebalanceState(config.runtime.stateFile, state);
+          logger.info(`ship 广播前准备失败，下一轮重试同一冻结计划：逻辑仓位=${plan.logicalPositionKey}，原因=${message}`);
+          return;
+        }
         if (latest.stage === "DOCK_SENT" || latest.stage === "DOCK_VERIFIED" || latest.stage === "SHIP_PREPARED" || latest.stage === "SHIP_SENT") {
           // 广播过 dock/ship 后的 RPC 读取错误不能覆盖原阶段；下一轮必须只读恢复同一笔交易，禁止补建第二个仓位。
           logger.info(`存在已广播或已冻结的计划，保留原计划供下一轮恢复：逻辑仓位=${plan.logicalPositionKey}，阶段=${latest.stage}，原因=${message}`);

@@ -4,7 +4,7 @@
  * 主要流程：构造确定性余额和 1e18 价格区间 -> 调用纯函数 -> 断言唯一动作。
  */
 import { expect, test } from "bun:test";
-import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableBlockedPlan, reconcileConfiguredPositionSlots, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
+import { buildLogicalPositionKey, deriveWalletShipAmounts, isRetryableBlockedPlan, isRetryableUnbroadcastDockPlan, isRetryableUnbroadcastShipPlan, reconcileConfiguredPositionSlots, unsupportedStrategyReason } from "../src/app/rebalance-bot.ts";
 import type { AddLpConfig } from "../src/config/lp-config.ts";
 import type { ApiStrategy } from "../src/infra/aqua-api.ts";
 import type { StateDocument } from "../src/infra/rebalance-state.ts";
@@ -42,6 +42,21 @@ test("仅安全的 BLOCKED 计划允许重新决策", () => {
   expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "Transaction creation failed.", targetAmountsRaw: ["1", "0"] })).toBe(false);
   expect(isRetryableBlockedPlan({ stage: "BLOCKED", blockedReason: "ship 回执失败" })).toBe(false);
   expect(isRetryableBlockedPlan({ stage: "DOCK_SENT", blockedReason: "nonce too low" })).toBe(false);
+});
+
+/** 历史版本可能把 fee/签名失败误记为 DOCK_SENT；只有无 hash 且未冻结 ship 的计划能在链上确认旧策略仍 active 后重试。 */
+test("仅无广播痕迹的 dock 计划允许链上确认后重试", () => {
+  expect(isRetryableUnbroadcastDockPlan({ stage: "DOCK_SENT" })).toBe(true);
+  expect(isRetryableUnbroadcastDockPlan({ stage: "DOCK_SENT", dockTransactionHash: "0x01" })).toBe(false);
+  expect(isRetryableUnbroadcastDockPlan({ stage: "DOCK_SENT", targetAmountsRaw: ["1", "0"] })).toBe(false);
+  expect(isRetryableUnbroadcastDockPlan({ stage: "PLAN_PERSISTED" })).toBe(false);
+});
+
+/** ship 广播前失败只能回滚发送阶段，冻结的金额、salt 和新 hash 必须完整保留。 */
+test("无广播 hash 的冻结 ship 计划允许回滚重试", () => {
+  expect(isRetryableUnbroadcastShipPlan({ stage: "SHIP_SENT", walletBalancesRaw: ["1", "2"], targetAmountsRaw: ["1", "2"], salt: "3", shipStrategyHash: "0xhash" })).toBe(true);
+  expect(isRetryableUnbroadcastShipPlan({ stage: "SHIP_SENT", shipTransactionHash: "0x01", walletBalancesRaw: ["1", "2"], targetAmountsRaw: ["1", "2"], salt: "3", shipStrategyHash: "0xhash" })).toBe(false);
+  expect(isRetryableUnbroadcastShipPlan({ stage: "SHIP_SENT", walletBalancesRaw: ["1", "2"], targetAmountsRaw: ["1", "2"] })).toBe(false);
 });
 
 /** 配置只维护数量和补仓模板；已成交策略即便模式变化，也必须继续占用已有配置槽位。 */

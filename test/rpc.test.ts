@@ -7,7 +7,7 @@
 import { expect, test } from "bun:test";
 import { custom, defineChain, keccak256, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { parseEip1559FeeOverrides, RawBroadcastIndeterminateError, sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
+import { parseEip1559FeeOverrides, PreBroadcastTransactionError, RawBroadcastIndeterminateError, sendLocallySignedTransaction, sendLocallySignedTransactions } from "../src/infra/rpc.ts";
 
 /** 测试专用链定义；不连接公共 RPC，也不携带任何真实账户或真实节点信息。 */
 const testChain = defineChain({
@@ -107,6 +107,25 @@ test("raw 广播拒绝时记录阶段和安全交易参数，不自动重试", a
   }, {})).rejects.toThrow("raw 广播失败：nonce=12，gas=100000，maxFeePerGas=2200000000，maxPriorityFeePerGas=1000000000，原因=Missing or invalid parameters.");
   expect(rawRequestCount).toBe(1);
   expect(requests.filter((request) => request.method === "eth_sendRawTransaction")).toHaveLength(1);
+});
+
+/** RPC 费率查询被限流发生在签名和 raw 广播前；调用方可明确将计划恢复为可重试状态。 */
+test("EIP-1559 fee 限流标记为广播前失败且不发送 raw", async () => {
+  const requests: Array<{ method: string; params?: unknown[] }> = [];
+  const transport = custom({
+    async request(args: { method: string; params?: unknown[] }): Promise<Hex> {
+      requests.push(args);
+      if (args.method === "eth_getTransactionCount") return "0xc";
+      if (args.method === "eth_estimateGas") return "0x186a0";
+      if (args.method === "eth_maxPriorityFeePerGas") throw new Error("cu limit exceeded; request too fast per second");
+      if (args.method === "eth_getBlockByNumber") return { baseFeePerGas: "0x3b9aca00" } as unknown as Hex;
+      throw new Error(`不应调用 RPC 方法：${args.method}`);
+    },
+  });
+  await expect(sendLocallySignedTransaction(testAccount, testChain, transport, {
+    to: "0x1111113ccf1426a8e30e2bff5e005d929bf6a90a", data: "0x28defc17", value: 0n,
+  }, {})).rejects.toBeInstanceOf(PreBroadcastTransactionError);
+  expect(requests.some((request) => request.method === "eth_sendRawTransaction")).toBe(false);
 });
 
 /** HTTP 超时不等于节点未接收 raw；共享层必须给出本地 hash 供调用方只读查回执，且绝不重发。 */

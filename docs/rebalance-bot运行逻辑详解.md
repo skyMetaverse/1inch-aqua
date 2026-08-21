@@ -213,7 +213,7 @@ BLOCKED
 阶段含义：
 
 - `PLAN_PERSISTED`：已经决定重挂并保存计划，但尚未发送 dock。
-- `DOCK_SENT`：dock 已进入发送阶段，保存了 dock 交易 hash。
+- `DOCK_SENT`：dock 已进入发送保护阶段。正常情况下保存 dock 交易 hash；广播前 fee、nonce、gas 或本地签名失败时，运行时会将无 hash 计划回滚为 `PLAN_PERSISTED`。
 - `DOCK_VERIFIED`：dock receipt、`Docked` 事件和 docked `rawBalances` 已验证。
 - `SHIP_PREPARED`：已读取 dock 后钱包余额，并冻结 ship 金额、salt 和新策略 hash。
 - `SHIP_SENT`：ship 已进入发送阶段，保存了 ship 交易 hash。
@@ -711,9 +711,11 @@ rawBalances(maker, app, sourceStrategyHash, token)
 
 ### 18.4 dock 模拟和持久化
 
-Bot 构造 dock calldata，先执行 `eth_call` 模拟。模拟成功后立即把阶段写成 `DOCK_SENT`，然后本地签名并广播。
+Bot 构造 dock calldata，先执行 `eth_call` 模拟。模拟成功后先把阶段写成 `DOCK_SENT`，再本地读取 nonce、gas 和 EIP-1559 fee，完成本地签名并广播。
 
-这样即使广播或回执等待期间进程中断，state 仍然知道该计划已经进入 dock 发送阶段。
+先落盘 `DOCK_SENT` 是为了覆盖 raw 广播已经发出但进程恰好在保存交易 hash 前中断的窗口。若 fee、nonce、gas 或本地签名阶段失败，RPC 层返回明确的 `PreBroadcastTransactionError`；外层确认没有 hash 和冻结字段后，将计划回滚为 `PLAN_PERSISTED`，下一轮重试同一计划。
+
+历史版本可能遗留无 hash 的 `DOCK_SENT`。恢复时会先读取旧策略的 `rawBalances`：如果旧策略仍为 active，确认 dock 未成功后重试；如果已经是 docked，则进入后续恢复；链上状态不一致或查询失败时保持停止，避免重复广播。
 
 ### 18.5 dock 广播和复核
 
@@ -846,6 +848,14 @@ Aqua `ship` 主要登记 virtual balance，不立即执行 ERC20 转账。真实
 
 禁止节点代签。
 
+如果 nonce、gas、EIP-1559 fee 或本地签名阶段失败，尚未调用 `eth_sendRawTransaction`，则：
+
+```text
+dock：将 DOCK_SENT 回滚为 PLAN_PERSISTED，下一轮重试同一 dock 计划
+ship：将 SHIP_SENT 回滚为 SHIP_PREPARED，保留冻结的金额、salt 和 strategyHash
+```
+
+两种路径都只在没有交易 hash 时执行；下一轮仍会重新读取链上状态。
 如果广播响应超时，但本地已经根据签名交易计算出 hash，则：
 
 ```text
@@ -995,7 +1005,7 @@ Bot 会：
 4. 新策略资金必须来自 dock 后真实钱包余额。
 5. `SHIP_PREPARED` 后金额、salt 和 hash 不得改变。
 6. 已广播交易不自动重发 raw transaction。
-7. 已广播或已冻结计划优先恢复，不能重新生成替代策略。
+7. 已广播或已冻结计划优先恢复，不能重新生成替代策略；明确发生在 raw 广播前的 RPC 限流或签名失败允许按同一计划重试。
 8. 两个及以上新缺失 LP 使用一笔 atomic multicall。
 9. 所有 ship 必须经过 receipt、事件和 rawBalances 多层复核。
 10. 只有确认未广播、未冻结且可追踪状态不存在时，才允许删除计划重做。

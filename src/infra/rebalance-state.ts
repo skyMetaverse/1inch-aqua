@@ -131,7 +131,7 @@ function validateWalletFundedAmounts(plan: PersistedPlan, key: string): void {
   if (plan.targetMode === "two-sided" && (target[0] <= 0n || target[1] <= 0n || target[0] !== wallet[0] || target[1] !== wallet[1])) throw new Error(`状态计划 ${key} two-sided 钱包资金快照与投入额不一致`);
 }
 
-/** v3 阶段校验防止 dock 前 API 快照被误用成新策略资金，或已冻结 ship 在恢复时被改写。 */
+/** 阶段校验防止 dock 前 API 快照被误用成新策略资金，或已冻结 ship 在恢复时被改写；DOCK_SENT 无 hash 允许由运行时按链上状态判断是否为广播前失败。 */
 function validateV3Plan(plan: PersistedPlan, key: string): PersistedPlan {
   const preShip = ["PLAN_PERSISTED", "DOCK_SENT", "DOCK_VERIFIED"] as const;
   if (preShip.includes(plan.stage as typeof preShip[number])) {

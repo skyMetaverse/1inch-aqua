@@ -32,6 +32,14 @@ export class RawBroadcastIndeterminateError extends Error {
   }
 }
 
+/** 广播前准备阶段失败；此时尚未调用 eth_sendRawTransaction，可以安全在下一轮重试同一计划。 */
+export class PreBroadcastTransactionError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "PreBroadcastTransactionError";
+  }
+}
+
 /** .env 中可选的 EIP-1559 绝对费率上限；单位转换后始终使用 wei。 */
 export interface Eip1559FeeOverrides {
   maxFeePerGas?: bigint;
@@ -230,14 +238,14 @@ export async function sendLocallySignedTransaction(
     // 优先使用节点已知的更高 nonce；节点查询短暂滞后时，保留本进程刚广播或等待回执交易的后续 nonce。
     nonce = transaction.nonce ?? Math.max(rpcNonce, nextNonceByAccount.get(accountNonceKey) ?? 0);
   } catch (error) {
-    throw new Error(`读取 pending nonce 失败：${firstErrorLine(error)}`);
+    throw new PreBroadcastTransactionError(`读取 pending nonce 失败：${firstErrorLine(error)}`);
   }
 
   let gas: bigint;
   try {
     gas = transaction.gas ?? await publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value });
   } catch (error) {
-    throw new Error(`估算 gas 失败：nonce=${nonce}，原因=${firstErrorLine(error)}`);
+    throw new PreBroadcastTransactionError(`估算 gas 失败：nonce=${nonce}，原因=${firstErrorLine(error)}`);
   }
 
   let fees: Eip1559Fees;
@@ -247,7 +255,7 @@ export async function sendLocallySignedTransaction(
     fees = resolveEip1559Fees(transaction, feeContext.estimated, feeContext.baseFeePerGas, feeOverrides);
     serialized = await signPreparedTransaction(account, chain, transaction, nonce, gas, fees);
   } catch (error) {
-    throw new Error(`EIP-1559 fee 解析或本地签名失败：nonce=${nonce}，gas=${gas}，原因=${firstErrorLine(error)}`);
+    throw new PreBroadcastTransactionError(`EIP-1559 fee 解析或本地签名失败：nonce=${nonce}，gas=${gas}，原因=${firstErrorLine(error)}`);
   }
 
   try {
